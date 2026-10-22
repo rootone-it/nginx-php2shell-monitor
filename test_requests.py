@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Sends test requests to the monitor, the way nginx would mirror them, or to a
-site through nginx.
+Sends a handful of test requests - either straight to the monitor, the way
+nginx would mirror them, or to a real site through nginx.
 
-The "suspicious" requests only mimic the shape of the known attacks (overlong
-field name, field without a name containing NUL bytes, upload progress field).
-They contain no exploit.
+The "suspicious" requests only copy the shape of the known attacks (a huge
+field name, a nameless field with NUL bytes, the upload progress field).
+There is no exploit in them.
 
 Usage:
-    python3 test_requests.py                                # monitor directly
+    python3 test_requests.py                                # straight to the monitor
     python3 test_requests.py --url https://example.com      # through nginx
 
-Expected: the first two requests stay silent, all others produce a HIT
-("too many fields" as generic, the others as php2shell), the last one as a
-repetition. Through nginx, the IP in the HIT must be your real one, not the
-test IP from this script - nginx overwrites the header.
+What you should see: the first two requests don't trigger anything. Each of
+the others produces a HIT ("too many fields" as generic, the rest as
+php2shell), and the last one is reported as a repeat. When going through
+nginx, the HIT should show your real IP rather than the fake one this script
+sends, because nginx replaces that header.
 """
 
 import argparse
@@ -33,8 +34,8 @@ def multipart(fields):
 
 
 def long_field_name_body():
-    # Shape as described in the public analyses: field without a name with a binary
-    # value, a=1, then a ~3.5 MB field name ending in [x]=1. Filler is arbitrary.
+    # Same shape as in the public write-ups: a nameless field with a binary value,
+    # then a=1, then a ~3.5 MB field name ending in [x]=1. The filler doesn't matter.
     return b"=" + urllib.parse.quote_from_bytes(b"\x00\x01\x02\xff" * 16).encode() \
         + b"&a=1&" + b"A" * 3500000 + b"[x]=1"
 
@@ -44,13 +45,13 @@ TESTS = [
      b"username=test%40example.org&password=secret&redirect=%2F", "10.0.0.1"),
     ("clean: contact form multipart", "/contact", "multipart/form-data; boundary=" + BOUNDARY,
      multipart([("email", b"test@example.org"), ("comment", b"Hello")]), "10.0.0.1"),
-    ("overlong field name + nameless field with NUL bytes", "/", "application/x-www-form-urlencoded",
+    ("huge field name + nameless field with NUL bytes", "/", "application/x-www-form-urlencoded",
      long_field_name_body(), "203.0.113.7"),
     ("upload progress field", "/login", "multipart/form-data; boundary=" + BOUNDARY,
      multipart([("PHP_SESSION_UPLOAD_PROGRESS", b"x" * 64), ("file", b"y" * 128)]), "2001:db8::7"),
     ("too many fields", "/cart", "application/x-www-form-urlencoded",
      "&".join("f%d=1" % i for i in range(1500)).encode(), "198.51.100.9"),
-    ("repetition of the upload progress request", "/login", "multipart/form-data; boundary=" + BOUNDARY,
+    ("upload progress field again (repeat)", "/login", "multipart/form-data; boundary=" + BOUNDARY,
      multipart([("PHP_SESSION_UPLOAD_PROGRESS", b"x" * 64), ("file", b"y" * 128)]), "2001:db8::7"),
 ]
 
@@ -58,7 +59,7 @@ TESTS = [
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:9777",
-                        help="monitor directly (default) or a site through nginx, e.g. https://example.com")
+                        help="where to send the requests: the monitor itself (default) or a site behind nginx, e.g. https://example.com")
     args = parser.parse_args()
     target = urllib.parse.urlparse(args.url)
 

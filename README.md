@@ -1,97 +1,105 @@
 # nginx-php2shell-monitor
 
-Live detection of **PHP2Shell** attack attempts (CVE-2026-109618, CVE-2026-109619) based on
-the **full POST body**, for servers running nginx in front of PHP (php-fpm).
+See whether anyone is trying to exploit **PHP2Shell** (CVE-2026-109618, CVE-2026-109619) on
+your server - by looking at the **full POST body** of every request that reaches PHP.
 
-nginx mirrors every POST that is handed to PHP to a small Python daemon on `127.0.0.1`. The
-daemon inspects the body and stores suspicious requests byte-exact as individual files, so you
-can see whether - and how - your server is being attacked.
+nginx sends a copy of each POST to a small Python daemon listening on `127.0.0.1`. The daemon
+checks the body for the patterns seen in PHP2Shell attacks and saves any suspicious request
+exactly as it arrived, so you can see what was sent, when, and from where.
 
-> **This is monitoring, not protection.** The monitor only sees copies and cannot block
-> anything. The fix for PHP2Shell is updating PHP (8.2.35, 8.3.36, 8.4.27, 8.5.12 or your
-> distribution's patched package) and restarting php-fpm.
+> **This tool detects, it does not protect.** It only ever sees copies of requests, so it
+> can't block anything. To fix PHP2Shell, update PHP (8.2.35, 8.3.36, 8.4.27, 8.5.12, or your
+> distribution's patched package) and restart php-fpm.
 
-- Python 3 standard library only, no packages to install
-- nginx built-in `mirror` module, no extra nginx modules
-- The site is unaffected if the monitor is down
+- Pure Python 3 standard library - nothing to install
+- Uses nginx's built-in `mirror` module - no extra nginx modules
+- If the daemon is down, your site keeps working as before
 
 ## Background
 
-PHP2Shell is the name for two PHP core flaws disclosed in October 2026 that can lead to
-unauthenticated remote code execution with the privileges of the PHP worker. The publicly
-described trigger paths act while PHP starts up the request, before application code runs -
-so PHP applications behind an affected PHP version are exposed regardless of the framework.
+PHP2Shell is a pair of flaws in PHP itself, disclosed in October 2026. They can let an
+unauthenticated attacker run code with the privileges of the PHP worker. The trigger paths
+described so far fire while PHP is still setting up the request, before your application gets
+to run - so it doesn't matter which framework or CMS you use.
 
-Public analyses describe two trigger paths:
+Public write-ups describe two ways in:
 
-- **CVE-2026-109618**: a crafted `application/x-www-form-urlencoded` POST that drives PHP into
-  `memory_limit` during POST parsing - a field without a name holding binary data / NUL bytes,
-  and a field name of about 3.5 MB ending in `[x]=1`.
-- **CVE-2026-109619**: stale global state after fatal errors, reachable via the session upload
-  progress feature (`session.upload_progress.enabled`, on by default) - multipart POSTs with
-  `PHP_SESSION_UPLOAD_PROGRESS`.
+- **CVE-2026-109618**: a crafted `application/x-www-form-urlencoded` POST that pushes PHP past
+  `memory_limit` while it parses the form data. The known payload contains a field with no
+  name and a binary value (including NUL bytes), followed by a field name of roughly 3.5 MB
+  that ends in `[x]=1`.
+- **CVE-2026-109619**: stale global state left behind after a fatal error, reachable through
+  PHP's session upload progress feature (`session.upload_progress.enabled`, on by default).
+  The tell-tale sign is a multipart POST containing `PHP_SESSION_UPLOAD_PROGRESS`.
 
-The default access log does not contain request bodies, which is why this monitor looks at
-the bodies themselves.
+Your access log won't help here: it doesn't record request bodies. That's the gap this tool
+fills.
 
 ## How it works
 
 ```
-client ── POST ──> nginx ─────────────────> php-fpm (unchanged)
+client ── POST ──> nginx ─────────────────────────> php-fpm (untouched)
                      │
-                     └─ mirror (copy incl. body) ──> monitor.py on 127.0.0.1:9777
-                                                       ├─ answers 204 immediately
-                                                       ├─ analysis in a worker thread
-                                                       └─ suspicious -> captures/*.req + *.json
+                     └─ mirror: copy with full body ──> monitor.py on 127.0.0.1:9777
+                                                          ├─ replies 204 right away
+                                                          ├─ inspects the body in a worker thread
+                                                          └─ if suspicious: captures/*.req + *.json
 ```
 
-- The `mirror` directives go into the location(s) that call `fastcgi_pass`. The copy is sent to
-  the internal location `/__php2shell_monitor` (`nginx/php2shell-mirror.conf`), which forwards only
-  POST requests to the monitor.
-- The client IP is passed in `X-Php2shell-Client-Ip`. nginx's `proxy_set_header` replaces a
-  client-sent header of the same name, so the IP cannot be spoofed.
+- You add the `mirror` directives to the location(s) that call `fastcgi_pass`. nginx sends
+  the copy to an internal location, `/__php2shell_monitor` (`nginx/php2shell-mirror.conf`),
+  which passes POST requests on to the daemon and drops everything else.
+- The client's IP travels in the `X-Php2shell-Client-Ip` header. Because nginx's
+  `proxy_set_header` overrides any header of the same name sent by the client, the IP can't be
+  spoofed.
 
 ## Detection rules
 
-Each rule has a level. A request is `php2shell` as soon as at least one `php2shell` rule fires,
-otherwise `generic`. **Both are stored**; the level appears in the log, the file name and the
-`.json`. `generic` also catches other attacks, bots and legitimate large uploads.
+Every rule belongs to one of two levels. If any `php2shell` rule matches, the request is
+classed as `php2shell`; otherwise it's `generic`. **Both levels are saved** - the level shows
+up in the log, in the file name and in the `.json`. Expect `generic` hits from other kinds of
+attacks, from bots, and from legitimate large uploads.
 
-| Rule | Level | Fires on | Relation |
+| Rule | Level | Matches when | Why it matters |
 |---|---|---|---|
-| `long_field_name` | php2shell | field name longer than `max_field_name_length` (urlencoded and multipart) | CVE-2026-109618: ~3.5 MB field name ending in `[x]` |
-| `upload_progress_field` | php2shell | `PHP_SESSION_UPLOAD_PROGRESS` in the body (raw or URL-decoded) | CVE-2026-109619 / session upload progress variants |
-| `empty_field_name` | generic | urlencoded field without a name | part of CVE-2026-109618, but also bots/spam |
-| `nul_byte` | generic | NUL byte in a field name/value or part header | part of CVE-2026-109618, but also generic scanners |
-| `too_many_fields` | generic | more than `max_fields` fields | unusual field count |
-| `large_body` | generic | body of `large_body_bytes` or more, except below `large_body_ignore_paths` | large payloads |
-| `multipart_without_boundary` | generic | multipart without boundary | malformed / crafted requests |
+| `long_field_name` | php2shell | a field name is longer than `max_field_name_length` (urlencoded or multipart) | CVE-2026-109618: ~3.5 MB field name ending in `[x]` |
+| `upload_progress_field` | php2shell | the body contains `PHP_SESSION_UPLOAD_PROGRESS` (raw or URL-encoded) | CVE-2026-109619 and other upload-progress variants |
+| `empty_field_name` | generic | a urlencoded field has no name | part of CVE-2026-109618, but bots and spammers do this too |
+| `nul_byte` | generic | a field name, value or part header contains a NUL byte | part of CVE-2026-109618, but also common in generic scanners |
+| `too_many_fields` | generic | there are more than `max_fields` fields | unusually large forms |
+| `large_body` | generic | the body is at least `large_body_bytes`, outside `large_body_ignore_paths` | oversized payloads |
+| `multipart_without_boundary` | generic | a multipart request has no boundary | malformed or hand-crafted requests |
 
-Thresholds live in `config.ini` (`[rules]`), the level mapping in `PHP2SHELL_RULES` in
-`monitor.py`.
+Thresholds are set in the `[rules]` section of `config.ini`. Which rules count as `php2shell`
+is defined by `PHP2SHELL_RULES` in `monitor.py`.
 
-The rules match the **shape** of the attacks known from the first public analyses, not working
-exploits. Modified variants may avoid them. Contributions with new indicators are welcome.
+These rules look for the **shape** of the attacks described in the first public analyses -
+they don't check whether a payload would actually work. A modified attack may slip past them.
+If you spot new indicators, pull requests are welcome.
 
 ## Output
 
-- Console and log file: one `HIT` line per suspicious request plus details, a `STATUS` line
-  every `stats_interval` seconds. If the number of checked POSTs in the `STATUS` line does not
-  grow, nginx is not delivering copies.
-- `captures/` (mode 0700, files 0600):
-  - `2026-10-22_15-04-05_php2shell_203.0.113.7_123f550a1b.req` (date_level_ip_hash):
-    request line, headers as forwarded by nginx, empty line, body byte-exact and untruncated.
-  - matching `.json`: time, level, IP, host, URL, size, SHA-256, findings with details.
-  - An identical body from the same IP is stored only once, repetitions are only logged.
-  - Once `max_total_mb` is reached, only `.json` files are written. Nothing is ever deleted.
-- Mail: optional via `[mail] to`, at most one mail per IP within `min_interval`.
+- **Console and log file**: a `HIT` line for every suspicious request, followed by the details,
+  and a `STATUS` summary every `stats_interval` seconds. If the POST count in `STATUS` stays at
+  zero, nginx isn't sending any copies.
+- **`captures/`** (directory mode 0700, files 0600):
+  - `2026-10-22_15-04-05_php2shell_203.0.113.7_123f550a1b.req` (date_level_ip_hash): the
+    request line, the headers as nginx forwarded them, a blank line, then the body exactly as
+    received - nothing is cut off.
+  - A `.json` file with the same name: time, level, IP, host, URL, size, SHA-256 and the
+    matching rules with details.
+  - If the same IP sends the same body again, it's logged but not saved a second time.
+  - Once the directory reaches `max_total_mb`, only `.json` files are written. Nothing is ever
+    deleted automatically.
+- **Email** (optional): set `[mail] to`. You'll get at most one email per IP every
+  `min_interval` seconds.
 
 ## Installation
 
-Requirements: nginx with php-fpm, Python 3.8+ (tested with 3.9 and 3.12). Tested in production
-on Ubuntu 24.04 with nginx 1.24 and PHP 8.3 (php-fpm).
+You'll need nginx with php-fpm and Python 3.8 or newer (tested with 3.9 and 3.12). Running in
+production on Ubuntu 24.04 with nginx 1.24 and PHP 8.3 (php-fpm).
 
-### 1. Monitor
+### 1. The daemon
 
 ```bash
 sudo git clone https://github.com/rootone-it/nginx-php2shell-monitor.git /opt/nginx-php2shell-monitor
@@ -99,27 +107,29 @@ cd /opt/nginx-php2shell-monitor
 sudo cp config.example.ini config.ini
 ```
 
-Adjust `config.ini` (capture directory, log file, `large_body_ignore_paths` for upload routes
-of your application, optional mail). It is not tracked by git, so `git pull` updates the
-monitor without touching your settings - compare with `config.example.ini` after updates for
-new options. The monitor needs no root privileges (port > 1024,
-127.0.0.1 only) - run it as a user that can write the capture and log directories.
+Edit `config.ini`: where to store captures and logs, which upload routes of your application
+to exempt via `large_body_ignore_paths`, and optionally an email address.
+`config.ini` isn't tracked by git, so `git pull` won't overwrite your settings - after an
+update, check `config.example.ini` for new options.
 
-Start in the foreground first so errors are visible (stop with Ctrl+C):
+The daemon doesn't need root: it only listens on `127.0.0.1` on a port above 1024. Run it as
+any user that can write to the capture and log directories.
+
+Start it in the foreground first, so you see any errors straight away (Ctrl+C to stop):
 
 ```bash
 cd /opt/nginx-php2shell-monitor
 python3 monitor.py -c config.ini
 ```
 
-Then in the background, either with screen (the shell keeps the window open if the monitor
-exits, so the error stays readable; detach with Ctrl+A, D):
+Once that works, run it in the background. With screen (wrapping it in a shell keeps the
+window open if the daemon exits, so you can still read the error; detach with Ctrl+A, then D):
 
 ```bash
 screen -dmS php2shell bash -c 'python3 monitor.py -c config.ini; echo "monitor exited with code $?"; exec bash'
 ```
 
-or as a systemd service, e.g. `/etc/systemd/system/nginx-php2shell-monitor.service`:
+Or as a systemd service, e.g. `/etc/systemd/system/nginx-php2shell-monitor.service`:
 
 ```ini
 [Unit]
@@ -136,7 +146,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-Function test without nginx (in a second shell, hits appear in the monitor output):
+Quick check without nginx - run this in a second shell and watch the hits come in:
 
 ```bash
 python3 test_requests.py
@@ -148,47 +158,48 @@ python3 test_requests.py
 sudo cp /opt/nginx-php2shell-monitor/nginx/php2shell-mirror.conf /etc/nginx/snippets/
 ```
 
-In every server block to monitor (see `nginx/example-site.conf`):
+Then, in every server block you want to watch (see `nginx/example-site.conf`):
 
-1. `include /etc/nginx/snippets/php2shell-mirror.conf;` inside the `server` block.
-2. `mirror /__php2shell_monitor;` and `mirror_request_body on;` in each location that calls
-   `fastcgi_pass` - **only there**. If a location with `try_files` redirects internally to
-   `/index.php`, a mirror in both locations mirrors every request twice. Named locations
-   (`@php`) work as well.
+1. Add `include /etc/nginx/snippets/php2shell-mirror.conf;` inside the `server` block.
+2. Add `mirror /__php2shell_monitor;` and `mirror_request_body on;` to each location that
+   calls `fastcgi_pass` - **and nowhere else**. A typical `location /` with `try_files` hands
+   the request over to `/index.php` internally; with a mirror in both places, every request
+   would be copied twice. Named locations (`@php`) work fine.
 
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Test through nginx (the IP in the hit must be your real one):
+Now test through nginx. The IP in the hits should be your real one, not the fake IP the script
+sends:
 
 ```bash
 python3 test_requests.py --url https://example.com
 ```
 
-The test requests are sent to your real application and will get whatever responses it gives
-(e.g. 404/405). They contain no exploit.
+These requests hit your real application, so expect whatever it normally answers (404, 405,
+...). They mimic the shape of the attacks but contain no exploit.
 
-### Notes
+### Good to know
 
-- With `mirror_request_body on`, nginx reads the complete body before passing the request on.
-  For typical POST sizes this is not noticeable.
-- Bodies larger than `client_max_body_size` are rejected with 413 before mirroring and only
-  show up in the access log.
-- Requests rejected in the access phase (`allow`/`deny`, auth) are not mirrored.
-- Only POST is inspected - PHP only parses POST bodies automatically.
+- With `mirror_request_body on`, nginx reads the whole body before passing the request to PHP.
+  At normal POST sizes you won't notice.
+- Requests larger than `client_max_body_size` are rejected with a 413 before they're mirrored.
+  You'll only find them in the access log.
+- Requests blocked earlier on (`allow`/`deny`, auth) are never mirrored.
+- Only POST requests are checked - PHP only parses POST bodies on its own.
 
 ## Privacy
 
-Captured requests contain everything the client sent: cookies, session IDs and possibly
-personal data or credentials. This is especially true for `generic` hits, which can be caused
-by regular visitors. Keep the capture directory restricted, delete captures you no longer need
-and check whether running this is compatible with your privacy obligations (e.g. GDPR).
+A capture contains everything the client sent: cookies, session IDs, and possibly personal
+data or passwords. That applies especially to `generic` hits, which regular visitors can
+trigger too. Keep the capture directory locked down, delete captures you no longer need, and
+make sure running this fits your privacy obligations (GDPR, for example).
 
 ## Uninstall
 
-Remove the `include` and `mirror` lines, `sudo rm /etc/nginx/snippets/php2shell-mirror.conf`,
-`sudo nginx -t && sudo systemctl reload nginx`, stop the monitor.
+Remove the `include` and `mirror` lines, run `sudo rm /etc/nginx/snippets/php2shell-mirror.conf`
+and `sudo nginx -t && sudo systemctl reload nginx`, then stop the daemon.
 
 ## References
 
@@ -200,8 +211,8 @@ Remove the `include` and `mirror` lines, `sudo rm /etc/nginx/snippets/php2shell-
 
 ## Credits
 
-Developed by **Claude** (Anthropic, Claude Opus 5.5) together with **Andreas Boldt**.
+Written by **Claude** (Anthropic, Claude Opus 5.5) together with **Andreas Boldt**.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

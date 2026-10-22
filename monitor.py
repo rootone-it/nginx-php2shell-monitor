@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-nginx-php2shell-monitor - live detection of PHP2Shell attack attempts
-(CVE-2026-109618, CVE-2026-109619) based on full POST bodies.
+nginx-php2shell-monitor - spot PHP2Shell attack attempts (CVE-2026-109618,
+CVE-2026-109619) as they happen, by looking at full POST bodies.
 
-nginx mirrors every POST that is handed to PHP to this daemon (see
-nginx/php2shell-mirror.conf). The daemon inspects the body and stores
-suspicious requests byte-exact as individual files.
+nginx sends a copy of every POST that reaches PHP to this daemon (see
+nginx/php2shell-mirror.conf). The daemon checks each body and saves suspicious
+requests to disk exactly as they arrived, one file per request.
 
-Monitoring only: the monitor sees copies, it cannot block anything.
+Detection only: the daemon sees copies of requests and cannot block anything.
 
-Python standard library only, tested with Python 3.9 and 3.12.
+Uses nothing but the Python standard library. Tested with Python 3.9 and 3.12.
 
 Usage:  python3 monitor.py -c config.ini
 """
@@ -33,7 +33,7 @@ from urllib.parse import unquote_to_bytes
 
 
 # ---------------------------------------------------------------------------
-# Logging: console (for screen) + optional log file, thread-safe
+# Logging: to the console (handy under screen) and optionally to a file
 # ---------------------------------------------------------------------------
 
 class Log:
@@ -53,16 +53,16 @@ class Log:
 
 
 # ---------------------------------------------------------------------------
-# Body analysis
+# Inspecting the body
 # ---------------------------------------------------------------------------
 
-# PHP accepts the field name in Content-Disposition with and without quotes.
+# PHP accepts the field name in Content-Disposition both quoted and unquoted.
 MULTIPART_NAME_RE = re.compile(rb';\s*name=(?:"([^"]*)"|([^;\s]*))', re.IGNORECASE)
 BOUNDARY_RE = re.compile(r'boundary=(?:"([^"]+)"|([^;\s]+))', re.IGNORECASE)
 
-# Rules that target PHP2Shell closely. Hits of all other rules are stored just the
-# same, but classified as "generic" (other attacks, bots, large uploads, ...).
-# A request is "php2shell" as soon as at least one of these rules fires.
+# Rules aimed squarely at PHP2Shell. Every other rule still gets its hits saved,
+# but they're labelled "generic" (other attacks, bots, large uploads, ...).
+# One matching rule from this list is enough to label a request "php2shell".
 PHP2SHELL_RULES = ("long_field_name", "upload_progress_field")
 
 
@@ -71,7 +71,7 @@ def request_level(findings):
 
 
 def short(value, limit=80):
-    """Shortened, printable representation of a field name for log and JSON."""
+    """Printable, length-capped version of a field name for the log and JSON."""
     text = repr(value[:limit])[2:-1]
     if len(value) > limit:
         text += "...(%d bytes)" % len(value)
@@ -80,9 +80,9 @@ def short(value, limit=80):
 
 def parse_urlencoded(body):
     """
-    Splits an application/x-www-form-urlencoded body the way PHP does: separator
-    '&', name and value at the first '=', '+' as space, %XX decoded.
-    Returns a list of (name, value) as bytes.
+    Splits an application/x-www-form-urlencoded body the same way PHP does:
+    pairs separated by '&', name and value split at the first '=', '+' turned
+    into a space, %XX decoded. Returns a list of (name, value) byte strings.
     """
     fields = []
     for pair in body.split(b"&"):
@@ -97,8 +97,8 @@ def parse_urlencoded(body):
 
 def parse_multipart(body, content_type):
     """
-    Returns a list of (name, part_headers) of the multipart parts. Deliberately
-    simple: only as much as the rules need (field names and count).
+    Returns a list of (name, part_headers), one per multipart part. Kept
+    deliberately simple - the rules only need field names and the part count.
     """
     match = BOUNDARY_RE.search(content_type)
     if not match:
@@ -121,28 +121,30 @@ def parse_multipart(body, content_type):
 
 def analyze(req, rules):
     """
-    Checks a mirrored request. Returns a list of findings
-    [{"rule": ..., "detail": ..., "count": ..., "level": ...}], empty = clean.
+    Checks one mirrored request and returns what it found, as a list of
+    {"rule", "detail", "count", "level"} dicts. An empty list means clean.
     """
     findings = []
     body = req["body"]
     content_type = req["content_type"].lower()
 
-    # Upload progress field: trigger of the session based variants (CVE-2026-109619).
-    # Searched in the raw and the URL-decoded body, regardless of the content type.
+    # The upload progress field is what triggers the session-based variants
+    # (CVE-2026-109619). Look for it in both the raw and the URL-decoded body,
+    # whatever the content type claims to be.
     marker = rules["upload_progress_marker"].lower().encode()
     if marker in body.lower() or marker in unquote_to_bytes(body).lower():
         findings.append({"rule": "upload_progress_field",
-                         "detail": "%s in body" % rules["upload_progress_marker"]})
+                         "detail": "%s found in body" % rules["upload_progress_marker"]})
 
     fields = None
     if content_type.startswith("application/x-www-form-urlencoded"):
         fields = parse_urlencoded(body)
         for name, value in fields:
-            # Known attack (CVE-2026-109618): field without a name, binary value / NUL bytes.
+            # Part of the known CVE-2026-109618 payload: a nameless field with a
+            # binary value containing NUL bytes.
             if name == b"":
                 findings.append({"rule": "empty_field_name",
-                                 "detail": "field without name, value %d bytes" % len(value)})
+                                 "detail": "field with no name, value is %d bytes" % len(value)})
             if b"\x00" in name or b"\x00" in value:
                 findings.append({"rule": "nul_byte",
                                  "detail": "NUL byte in field '%s'" % short(name)})
@@ -150,7 +152,7 @@ def analyze(req, rules):
         fields = parse_multipart(body, req["content_type"])
         if fields is None:
             findings.append({"rule": "multipart_without_boundary",
-                             "detail": "multipart/form-data without boundary"})
+                             "detail": "multipart/form-data with no boundary"})
             fields = []
         for name, headers in fields:
             if b"\x00" in name or b"\x00" in headers:
@@ -158,25 +160,25 @@ def analyze(req, rules):
                                  "detail": "NUL byte in part header '%s'" % short(name)})
 
     if fields:
-        # Known attack (CVE-2026-109618): field name of ~3.5 MB ending in [x].
+        # The core of the known CVE-2026-109618 payload: a ~3.5 MB field name ending in [x].
         for name, _ in fields:
             if len(name) > rules["max_field_name_length"]:
                 findings.append({"rule": "long_field_name",
-                                 "detail": "field name %d bytes, ends with '%s'" % (
+                                 "detail": "field name is %d bytes, ends in '%s'" % (
                                      len(name), short(name[-40:]))})
 
         if len(fields) > rules["max_fields"]:
             findings.append({"rule": "too_many_fields",
                              "detail": "%d fields" % len(fields)})
 
-    # Large bodies outside of the paths where uploads are expected.
+    # Large bodies, except on paths where big uploads are expected.
     if len(body) >= rules["large_body_bytes"]:
         path = req["path"]
         if not any(path.startswith(prefix) for prefix in rules["large_body_ignore_paths"]):
             findings.append({"rule": "large_body",
-                             "detail": "%d bytes to %s" % (len(body), path.split("?")[0])})
+                             "detail": "%d bytes sent to %s" % (len(body), path.split("?")[0])})
 
-    # Merge repeated hits of the same rule (e.g. thousands of NUL byte fields).
+    # Collapse repeated hits of the same rule (a payload may carry thousands of NUL bytes).
     merged = OrderedDict()
     for finding in findings:
         if finding["rule"] in merged:
@@ -189,7 +191,7 @@ def analyze(req, rules):
 
 
 # ---------------------------------------------------------------------------
-# Storage of suspicious requests
+# Saving suspicious requests
 # ---------------------------------------------------------------------------
 
 class CaptureStore:
@@ -198,7 +200,7 @@ class CaptureStore:
         self.max_total_bytes = max_total_bytes
         self.log = log
         self.limit_warned = False
-        # (ip, sha256) -> file name, so identical repetitions are stored only once
+        # (ip, sha256) -> file name, so the same body from the same IP is only saved once
         self.seen = OrderedDict()
 
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
@@ -213,7 +215,7 @@ class CaptureStore:
         self.total_bytes += len(data)
 
     def save(self, req, findings):
-        """Returns (file_name_without_extension, is_duplicate)."""
+        """Returns (file name without extension, whether it was a repeat)."""
         sha = hashlib.sha256(req["body"]).hexdigest()
         key = (req["ip"], sha)
         if key in self.seen:
@@ -224,7 +226,8 @@ class CaptureStore:
         level = request_level(findings)
         base = "%s_%s_%s_%s" % (ts, level, ip_safe, sha[:10])
 
-        # Request as received from nginx: request line, headers, empty line, body (byte-exact)
+        # The request as nginx passed it on: request line, headers, blank line,
+        # then the body exactly as received.
         raw = "%s %s %s\r\n" % (req["method"], req["path"], req["version"])
         raw += "".join("%s: %s\r\n" % (k, v) for k, v in req["headers"])
         raw = raw.encode("latin-1", "replace") + b"\r\n" + req["body"]
@@ -249,7 +252,7 @@ class CaptureStore:
         if body_saved:
             self._write(os.path.join(self.dir, base + ".req"), raw)
         elif not self.limit_warned:
-            self.log.write("WARNING capture limit reached (%d MB), writing .json without body from now on"
+            self.log.write("WARNING capture limit of %d MB reached - saving .json metadata only from now on"
                            % (self.max_total_bytes // 1048576))
             self.limit_warned = True
 
@@ -263,7 +266,7 @@ class CaptureStore:
 
 
 # ---------------------------------------------------------------------------
-# Mail notification (optional)
+# Email alerts (optional)
 # ---------------------------------------------------------------------------
 
 class Mailer:
@@ -283,7 +286,7 @@ class Mailer:
         self.last_by_ip[req["ip"]] = now
 
         lines = [
-            "Suspicious POST request (PHP2Shell patterns)",
+            "A POST request matched PHP2Shell attack patterns.",
             "",
             "Time:  %s" % datetime.datetime.fromtimestamp(req["time"]).isoformat(),
             "IP:    %s" % req["ip"],
@@ -291,10 +294,10 @@ class Mailer:
             "Size:  %d bytes" % len(req["body"]),
             "File:  %s" % capture_name,
             "",
-            "Findings:",
+            "Matched rules:",
         ] + ["  - %s (%s): %s" % (f["rule"], f["level"], f["detail"]) for f in findings] + [
             "",
-            "Further hits from the same IP within %d minutes are only logged."
+            "Further hits from this IP in the next %d minutes will only be logged."
             % (self.min_interval // 60),
         ]
         message = "From: %s\nTo: %s\nSubject: [nginx-php2shell-monitor] %s %s %s\n" \
@@ -305,11 +308,11 @@ class Mailer:
             subprocess.run(["/usr/sbin/sendmail", "-t"], input=message.encode("utf-8"),
                            timeout=30, check=True)
         except Exception as e:
-            self.log.write("ERROR sending mail: %s" % e)
+            self.log.write("ERROR could not send email: %s" % e)
 
 
 # ---------------------------------------------------------------------------
-# HTTP endpoint for the mirrored requests
+# HTTP endpoint that receives the mirrored requests
 # ---------------------------------------------------------------------------
 
 class Stats:
@@ -329,7 +332,7 @@ class Stats:
 
 
 class MirrorHandler(http.server.BaseHTTPRequestHandler):
-    # Set in main()
+    # Filled in by main()
     work_queue = None
     max_body_bytes = 0
     stats = None
@@ -338,7 +341,7 @@ class MirrorHandler(http.server.BaseHTTPRequestHandler):
     server_version = "nginx-php2shell-monitor"
 
     def log_message(self, fmt, *args):
-        # No per-request access log
+        # Don't log every single request
         pass
 
     def _respond(self):
@@ -346,7 +349,7 @@ class MirrorHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # nginx only mirrors POST (see the if in php2shell-mirror.conf), ignore everything else
+        # nginx only forwards POST (see the "if" in php2shell-mirror.conf); ignore anything else
         self._respond()
 
     do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_GET
@@ -355,7 +358,7 @@ class MirrorHandler(http.server.BaseHTTPRequestHandler):
         received = time.time()
         length = int(self.headers.get("Content-Length") or 0)
 
-        # Read the full body before answering; nginx sends it completely anyway.
+        # Read the whole body before replying - nginx sends all of it regardless.
         body = self.rfile.read(min(length, self.max_body_bytes))
         rest = length - len(body)
         while rest > 0:
@@ -364,7 +367,7 @@ class MirrorHandler(http.server.BaseHTTPRequestHandler):
                 break
             rest -= len(chunk)
 
-        # Answer immediately, analysis runs in the worker thread
+        # Reply straight away; the worker thread does the actual checking
         self._respond()
 
         self.stats.inc("posts")
@@ -404,7 +407,7 @@ def worker(work_queue, rules, store, mailer, stats, log):
                 "%s%s" % (f["rule"], " x%d" % f["count"] if f["count"] > 1 else "") for f in findings)
             if duplicate:
                 stats.inc("duplicates")
-                log.write("HIT %s %s %s%s %s -> repetition of %s"
+                log.write("HIT %s %s %s%s %s -> same as %s"
                           % (level, req["ip"], req["host"], req["path"], summary, name))
             else:
                 stats.inc("saved")
@@ -414,26 +417,26 @@ def worker(work_queue, rules, store, mailer, stats, log):
                     log.write("    %s (%s): %s" % (f["rule"], f["level"], f["detail"]))
                 mailer.notify(req, findings, name)
         except Exception as e:
-            log.write("ERROR analyzing %s %s: %r" % (req.get("ip"), req.get("path"), e))
+            log.write("ERROR while checking %s %s: %r" % (req.get("ip"), req.get("path"), e))
 
 
 def stats_loop(interval, stats, work_queue, log):
     while True:
         time.sleep(interval)
         log.write("STATUS %d POSTs checked, %d suspicious (%d php2shell, %d generic; "
-                  "%d saved, %d repetitions), %d dropped (queue full), queue %d"
+                  "%d saved, %d repeats), %d dropped because the queue was full, %d waiting"
                   % (stats.posts, stats.suspicious, stats.level_php2shell, stats.level_generic,
                      stats.saved, stats.duplicates, stats.dropped, work_queue.qsize()))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PHP2Shell monitor for POST requests mirrored by nginx")
+    parser = argparse.ArgumentParser(description="Watches POST requests mirrored by nginx for PHP2Shell attack patterns")
     parser.add_argument("-c", "--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini"))
     args = parser.parse_args()
 
     cfg = configparser.ConfigParser()
     if not cfg.read(args.config, encoding="utf-8"):
-        sys.exit("Config not found: %s (copy config.example.ini to config.ini first)" % args.config)
+        sys.exit("Config file not found: %s (copy config.example.ini to config.ini first)" % args.config)
 
     log = Log(cfg.get("log", "file", fallback="").strip())
 
@@ -465,8 +468,8 @@ def main():
     if interval > 0:
         threading.Thread(target=stats_loop, args=(interval, stats, work_queue, log), daemon=True).start()
 
-    # Remember why the monitor stopped for the STOP line. SIGTERM (systemd) and
-    # SIGHUP (terminal closed) shut down cleanly like Ctrl+C.
+    # Keep track of why we stopped, for the STOP line. SIGTERM (e.g. from systemd)
+    # and SIGHUP (terminal closed) get the same clean shutdown as Ctrl+C.
     stop_reason = ["serve_forever returned"]
 
     def on_signal(signum, _frame):
@@ -477,14 +480,14 @@ def main():
     if hasattr(signal, "SIGHUP"):  # not available on Windows
         signal.signal(signal.SIGHUP, on_signal)
 
-    log.write("START listening on %s:%d, captures in %s (%d MB used), mail to: %s"
+    log.write("START listening on %s:%d, saving captures to %s (%d MB used so far), email alerts to: %s"
               % (host, port, store.dir, store.total_bytes // 1048576, mailer.to or "-"))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         stop_reason[0] = "Ctrl+C (SIGINT)"
     server.server_close()
-    log.write("STOP (%s) %d POSTs checked, %d suspicious, %d saved"
+    log.write("STOP (%s) - %d POSTs checked, %d suspicious, %d saved"
               % (stop_reason[0], stats.posts, stats.suspicious, stats.saved))
 
 
