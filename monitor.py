@@ -433,7 +433,7 @@ def main():
 
     cfg = configparser.ConfigParser()
     if not cfg.read(args.config, encoding="utf-8"):
-        sys.exit("Config not found: %s" % args.config)
+        sys.exit("Config not found: %s (copy config.example.ini to config.ini first)" % args.config)
 
     log = Log(cfg.get("log", "file", fallback="").strip())
 

@@ -2,3 +2,4 @@ captures/
 *.log
 __pycache__/
 .idea/
+config.ini

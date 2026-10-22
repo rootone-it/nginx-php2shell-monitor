@@ -94,12 +94,15 @@ on Ubuntu 24.04 with nginx 1.24 and PHP 8.3 (php-fpm).
 ### 1. Monitor
 
 ```bash
-sudo mkdir -p /opt/nginx-php2shell-monitor
-sudo cp monitor.py config.ini test_requests.py /opt/nginx-php2shell-monitor/
+sudo git clone https://github.com/rootone-it/nginx-php2shell-monitor.git /opt/nginx-php2shell-monitor
+cd /opt/nginx-php2shell-monitor
+sudo cp config.example.ini config.ini
 ```
 
 Adjust `config.ini` (capture directory, log file, `large_body_ignore_paths` for upload routes
-of your application, optional mail). The monitor needs no root privileges (port > 1024,
+of your application, optional mail). It is not tracked by git, so `git pull` updates the
+monitor without touching your settings - compare with `config.example.ini` after updates for
+new options. The monitor needs no root privileges (port > 1024,
 127.0.0.1 only) - run it as a user that can write the capture and log directories.
 
 Start in the foreground first so errors are visible (stop with Ctrl+C):
@@ -142,7 +145,7 @@ python3 test_requests.py
 ### 2. nginx
 
 ```bash
-sudo cp nginx/php2shell-mirror.conf /etc/nginx/snippets/
+sudo cp /opt/nginx-php2shell-monitor/nginx/php2shell-mirror.conf /etc/nginx/snippets/
 ```
 
 In every server block to monitor (see `nginx/example-site.conf`):
