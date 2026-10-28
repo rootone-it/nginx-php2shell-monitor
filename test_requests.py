@@ -4,8 +4,12 @@ Sends test requests either directly to the monitor, in the same format as the
 copies sent by nginx, or to a website through nginx.
 
 The suspicious test requests have the structure of the known exploits (long
-field name, field without a name containing NUL bytes, upload progress field).
-They do not contain a working payload.
+field name, field without a name containing NUL bytes, upload progress field,
+multipart with LF-only line breaks). They do not contain a working payload.
+
+If the hook of the monitor is enabled, the requests with the level php2shell
+run the hook. With the nftables example hook, running this script through
+nginx blocks your own IP address unless it is on the allowlist.
 
 Usage:
     python3 test_requests.py                                # directly to the monitor
@@ -13,9 +17,10 @@ Usage:
 
 Expected result: the first two requests are not reported. All other requests
 produce a HIT line ("too many fields" and "multipart with LF-only lines" with
-the level generic, the others with the level php2shell). The last request is reported as a repeat. When the
-requests are sent through nginx, the HIT lines show your own IP address and not
-the IP address sent by this script, because nginx replaces the header.
+the level generic, the others with the level php2shell). The last request is
+reported as a repeat. When the requests are sent through nginx, the HIT lines
+show your own IP address and not the IP address sent by this script, because
+nginx replaces the header.
 """
 
 import argparse

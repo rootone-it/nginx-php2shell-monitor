@@ -7,7 +7,8 @@ nginx sends a copy of each POST request passed to PHP to this daemon (see
 nginx/php2shell-mirror.conf). The daemon inspects the request body and stores
 each suspicious request unchanged in a separate file.
 
-The daemon only receives copies of the requests and cannot block them.
+The daemon only receives copies of the requests and cannot block them. An
+optional hook command can block the IP address for further requests.
 
 Requires only the Python standard library. Tested with Python 3.9 and 3.12.
 
@@ -121,9 +122,10 @@ SERIALIZED_RE = re.compile(rb'(?:\||^)[OCa]:\d+:')
 # values contain more free text than file names.
 SERIALIZED_VALUE_RE = re.compile(rb'(?:^|\|)(?:[OC]:\d+:"|a:\d+:\{)')
 
-# Rules specific to PHP2Shell. A request receives the level "php2shell" if at
-# least one of these rules matches, otherwise the level "generic". Requests of
-# both levels are stored.
+# Rules with the rule level "php2shell" (specific to PHP2Shell). All other
+# rules have the rule level "generic". A request receives the request level
+# "php2shell" if at least one of these rules matches, "php2shell-chain" under
+# the conditions below, otherwise "generic". Requests of all levels are stored.
 PHP2SHELL_RULES = (
     "long_field_name",
     "upload_progress_field",

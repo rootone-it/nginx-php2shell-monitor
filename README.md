@@ -14,15 +14,16 @@ by other scripts.
 
 **What's new (2026-10-28):** the monitor now supports hooks, for example to block the IP address
 of an attacker in the firewall (examples in Python and PHP for nftables included). It writes an
-event log in JSON Lines format, rates complete exploit chains with the new level
-`php2shell-chain`, parses multipart bodies like PHP does, and has many new detection rules based
+event log in JSON Lines format, rates complete exploit chains with the new request level
+`php2shell-chain`, parses the multipart variants that PHP accepts, and has many new detection rules based
 on the published exploit tools. Existing installations must update the nginx snippet. See the
 [Changelog](#changelog) for details.
 
-**Note:** This tool detects attacks. It cannot block the inspected request, because it only
-receives copies. An optional hook can block the IP address for further requests. To fix
-PHP2Shell, update PHP to 8.2.35, 8.3.36, 8.4.27 or 8.5.12 (or install the patched package of your
-distribution) and restart php-fpm.
+> [!IMPORTANT]
+> **This tool detects attacks, it does not fix the vulnerability.** It cannot block the inspected
+> request, because it only receives copies. An optional hook can block the IP address for further
+> requests. To fix PHP2Shell, update PHP to 8.2.35, 8.3.36, 8.4.27 or 8.5.12 (or install the
+> patched package of your distribution) and restart php-fpm.
 
 Features:
 
@@ -41,10 +42,11 @@ framework.
 
 The published analyses describe two attack methods:
 
-- **CVE-2026-109618**: a crafted `application/x-www-form-urlencoded` request that exceeds
-  `memory_limit` while PHP parses the form data. The known exploit contains a field without a
-  name with binary content (including NUL bytes) and a field name of about 3.5 MB ending in
-  `[x]=1`.
+- **CVE-2026-109618**: a crafted request that exceeds `memory_limit` while PHP parses the form
+  data. The known exploit is an `application/x-www-form-urlencoded` request with a field without
+  a name with binary content (including NUL bytes) and a field name of about 3.5 MB ending in
+  `[x]=1`. Published tools also exhaust the memory with multipart requests, for example with many
+  header lines in one part.
 - **CVE-2026-109619**: use of stale data after a fatal error, triggered through the session upload
   progress feature (`session.upload_progress.enabled`, enabled by default). The request is a
   multipart POST request containing the field `PHP_SESSION_UPLOAD_PROGRESS`.
@@ -59,7 +61,8 @@ client ── POST ──> nginx ───────────────�
                      └─ mirror (copy with body) ──> monitor.py on 127.0.0.1:9777
                                                       ├─ responds with 204 immediately
                                                       ├─ inspects the body in a worker thread
-                                                      └─ suspicious: captures/*.req + *.json
+                                                      └─ suspicious: captures/*.req + *.json,
+                                                         event log, email, hook (optional)
 ```
 
 - The `mirror` directives are added to the location blocks that contain `fastcgi_pass`. nginx
@@ -70,68 +73,78 @@ client ── POST ──> nginx ───────────────�
 
 ## Detection rules
 
-Each rule has one of two levels, `php2shell` or `generic`. A request receives one of three
-levels:
+There are two kinds of levels:
 
-- `php2shell-chain`: the request carries the structure of a complete exploit chain - a trigger
-  rule (`upload_progress_field`) together with an injection or preparation rule
-  (`serialized_object_in_filename`, `php_code_in_filename`, `session_id_in_body`, `probe_filename`,
-  `suspicious_filename` or `array_spray`), or at least two `php2shell` rules.
-  `exploit_tool_user_agent` and `exploit_tool_marker` count as one rule here, because several
-  fingerprints in one request usually come from the same tool. This is a fully formed
-  exploitation attempt rather than a scan. It does not mean the attempt would have succeeded; that depends on the target's PHP version and configuration, which
-  are not visible in the request.
-- `php2shell`: at least one `php2shell` rule matched.
-- `generic`: only `generic` rules matched. These can also be caused by other attacks, by bots or
-  by legitimate large uploads.
+- **Rule level:** each rule is either `php2shell` (specific to PHP2Shell) or `generic` (also
+  caused by other attacks, by bots or by legitimate requests). The rule level is shown in the
+  table below.
+- **Request level:** from the matched rules, each suspicious request receives one of three
+  levels:
+  - `php2shell-chain`: the request carries the structure of a complete exploit chain - a trigger
+    rule (`upload_progress_field`) together with an injection or preparation rule
+    (`serialized_object_in_filename`, `php_code_in_filename`, `session_id_in_body`,
+    `probe_filename`, `suspicious_filename` or `array_spray`), or at least two rules with the
+    rule level `php2shell`. `exploit_tool_user_agent` and `exploit_tool_marker` count as one rule
+    here, because several fingerprints in one request usually come from the same tool. This is a
+    fully formed exploitation attempt rather than a scan. It does not mean the attempt would have
+    succeeded; that depends on the target's PHP version and configuration, which are not visible
+    in the request.
+  - `php2shell`: at least one rule with the rule level `php2shell` matched.
+  - `generic`: only rules with the rule level `generic` matched.
 
-Requests of all levels are stored. The level is included in the log, in the file name and in the
-`.json` file. The trigger and injection rules of the chain level are defined by
+Requests of all request levels are stored. The request level is included in the log, in the file
+name, in the `.json` file and in the event log. The trigger and injection rules of the chain level are defined by
 `PHP2SHELL_TRIGGER_RULES` and `PHP2SHELL_PAYLOAD_RULES` in `monitor.py`.
 
-| Rule | Level | Condition | Relation to PHP2Shell |
-|---|---|---|---|
-| `long_field_name` | php2shell | A field name is longer than `max_field_name_length` (urlencoded or multipart) | CVE-2026-109618: field name of about 3.5 MB ending in `[x]` |
-| `upload_progress_field` | php2shell | A multipart field is named exactly `upload_progress_marker` (case-sensitive, as compared by PHP) | CVE-2026-109619 and other upload progress variants. Applications with an upload progress bar send this field legitimately. |
-| `multipart_header_flood` | php2shell | A multipart part has more than `max_part_headers` header lines or a duplicate header name | CVE-2026-109618: memory amplification closed by the PHP fix |
-| `serialized_object_in_filename` | php2shell | An upload file name or the field name of a file part contains a serialized PHP object or array | Session injection through the upload progress handler, which stores both names |
-| `exploit_tool_user_agent` | php2shell | The User-Agent matches `tool_user_agent_regex` | User-Agent of published exploit tools. This is a weak indicator: most tool requests do not send it, and it is easy to change. Boundary markers are more stable. |
-| `exploit_tool_marker` | php2shell | The body or the Content-Type contains a string from `tool_markers`, or the Content-Type contains a string from `tool_content_type_markers` | Fixed strings and multipart boundaries of published exploit tools |
-| `probe_filename` | php2shell | An upload file name matches `tool_filename_regex` | File names of published screening tools for session injection |
-| `empty_boundary_probe` | php2shell | `empty_boundary` together with `large_body` or `deep_nested_field_name` | Memory exhaustion probe of a published screening tool, also with a replaced User-Agent |
-| `empty_field_name` | generic | A urlencoded field has no name | Part of CVE-2026-109618, also used by bots |
-| `nul_byte` | generic | A field name, field value or part header contains a NUL byte | Part of CVE-2026-109618, also used by vulnerability scanners |
-| `serialized_object_in_field` | generic | A urlencoded field value or a multipart field name starts with a serialized PHP object or array | Observed in exploitation attempts, also used by some applications |
-| `deep_nested_field_name` | generic | A field name has more than `max_field_nesting` array levels | Observed in requests with up to 200 levels |
-| `session_id_in_body` | generic | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
-| `php_code_in_filename` | generic | An upload file name or the field name of a file part contains `<?` | Session injection, also used in other upload attacks |
-| `suspicious_filename` | generic | An upload file name matches `suspicious_filename_regex` | Short file names from exploit chains (for example `p2s.txt`) that regular visitors could also use. Counts as injection rule for `php2shell-chain`. |
-| `upload_progress_text` | generic | The body contains `upload_progress_marker` (any case, plain or URL-encoded), but no multipart field has exactly this name | No effect in PHP. Scans with a wrong spelling, or free text such as a support request about the vulnerability. |
-| `long_filename` | generic | An upload file name is longer than `max_filename_length` | Session inflation through the upload progress handler |
-| `array_spray` | generic | At least `max_same_array_fields` fields have the same array name (for example `t[]`) | Sent by a published exploit tool. The purpose of these fields is unverified. |
-| `chunked_multipart` | generic | A multipart request was sent with `Transfer-Encoding: chunked` | Bypass of the `post_max_size` check |
-| `too_many_fields` | generic | The request has more than `max_fields` fields | Unusually large forms. The confirmed exploit chain sends 973 to 998 parts, just below the PHP default `max_input_vars = 1000`; the default threshold is therefore 500. |
-| `large_body` | generic | The body has at least `large_body_bytes` bytes and the path is not listed in `large_body_ignore_paths` | Unusually large requests |
-| `multipart_without_boundary` | generic | A multipart request has no boundary | Malformed or crafted requests |
-| `empty_boundary` | generic | The Content-Type of a multipart request contains `boundary=` with an empty value | Sent by a published screening tool. Browsers and common HTTP libraries never send it. |
-| `repeated_char_boundary` | generic | The multipart boundary consists of one character other than `-`, repeated at least eight times | Observed in the confirmed exploit chain. Easy to change. |
-| `bare_lf_multipart` | generic | A multipart delimiter line or header block contains a line break without CR | Sent by a published screening tool. Browsers always send CRLF. |
-| `malformed_content_disposition` | generic | A `Content-Disposition` does not start with `form-data`, or a part header has continuation lines | PHP accepts both, browsers send neither. Hides field and file names from simple parsers. |
-| `upload_progress_without_user_agent` | generic | `upload_progress_field` matched and the request has no User-Agent | The confirmed exploit chain and several scanners send no User-Agent |
-| `scanner_user_agent` | generic | The User-Agent matches `scanner_user_agent_regex` | Self-named version checkers. These are scans, not exploits. |
-| `other_campaign_marker` | generic | The Content-Type contains a string from `other_content_type_markers` | Other campaigns with a similar request shape (for example `wp2shell`), logged to separate them from PHP2Shell |
-| `react2shell_lookalike` | generic | The request has a `Next-Action` header | React2Shell requests (Next.js Server Actions), which also use chunked multipart bodies |
+The column "Counts for php2shell-chain" shows how a rule contributes to the request level
+`php2shell-chain`: a request with a *trigger* and a *payload* rule, or with at least two *signal*
+rules, receives this level. The two rules marked *signal (shared)* count as one signal together.
 
-The thresholds are configured in the `[rules]` section of `config.ini`. The rules with the level
-`php2shell` are defined in `PHP2SHELL_RULES` in `monitor.py`. Options added after the first
+| Rule | Rule level | Counts for php2shell-chain | Condition | Relation to PHP2Shell |
+|---|---|---|---|---|
+| `long_field_name` | php2shell | signal | A field name is longer than `max_field_name_length` (urlencoded or multipart) | CVE-2026-109618: field name of about 3.5 MB ending in `[x]` |
+| `upload_progress_field` | php2shell | trigger, signal | A multipart field is named exactly `upload_progress_marker` (case-sensitive, as compared by PHP) | CVE-2026-109619 and other upload progress variants. Applications with an upload progress bar send this field legitimately. |
+| `multipart_header_flood` | php2shell | signal | A multipart part has more than `max_part_headers` header lines or a duplicate header name | CVE-2026-109618: memory amplification closed by the PHP fix |
+| `serialized_object_in_filename` | php2shell | payload, signal | An upload file name or the field name of a file part contains a serialized PHP object or array | Session injection through the upload progress handler, which stores both names |
+| `exploit_tool_user_agent` | php2shell | signal (shared) | The User-Agent matches `tool_user_agent_regex` | User-Agent of published exploit tools. This is a weak indicator: most tool requests do not send it, and it is easy to change. Boundary markers are more stable. |
+| `exploit_tool_marker` | php2shell | signal (shared) | The body or the Content-Type contains a string from `tool_markers`, or the Content-Type contains a string from `tool_content_type_markers` | Fixed strings and multipart boundaries of published exploit tools |
+| `probe_filename` | php2shell | payload, signal | An upload file name matches `tool_filename_regex` | File names of published screening tools for session injection |
+| `empty_boundary_probe` | php2shell | signal | `empty_boundary` together with `large_body` or `deep_nested_field_name` | Memory exhaustion probe of a published screening tool, also with a replaced User-Agent |
+| `empty_field_name` | generic | - | A urlencoded field has no name | Part of CVE-2026-109618, also used by bots |
+| `nul_byte` | generic | - | A urlencoded field name or value, or a multipart part header contains a NUL byte | Part of CVE-2026-109618, also used by vulnerability scanners |
+| `serialized_object_in_field` | generic | - | A urlencoded field value or a multipart field name starts with a serialized PHP object or array | Observed in exploitation attempts, also used by some applications |
+| `deep_nested_field_name` | generic | - | A field name has more than `max_field_nesting` array levels | Observed in requests with up to 200 levels |
+| `session_id_in_body` | generic | payload | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
+| `php_code_in_filename` | generic | payload | An upload file name or the field name of a file part contains `<?` | Session injection, also used in other upload attacks |
+| `suspicious_filename` | generic | payload | An upload file name matches `suspicious_filename_regex` | Short file names from exploit chains (for example `p2s.txt`) that regular visitors could also use. |
+| `upload_progress_text` | generic | - | The body contains `upload_progress_marker` (any case, plain or URL-encoded), but no multipart field has exactly this name | No effect in PHP. Scans with a wrong spelling, or free text such as a support request about the vulnerability. |
+| `long_filename` | generic | - | An upload file name is longer than `max_filename_length` | Session inflation through the upload progress handler |
+| `array_spray` | generic | payload | At least `max_same_array_fields` fields have the same array name (for example `t[]`) | Sent by a published exploit tool. The purpose of these fields is unverified. |
+| `chunked_multipart` | generic | - | A multipart request was sent with `Transfer-Encoding: chunked` | Bypass of the `post_max_size` check |
+| `too_many_fields` | generic | - | The request has more than `max_fields` fields | Unusually large forms. The confirmed exploit chain sends 973 to 998 parts, just below the PHP default `max_input_vars = 1000`; the default threshold is therefore 500. |
+| `large_body` | generic | - | The body has at least `large_body_bytes` bytes and the path is not listed in `large_body_ignore_paths` | Unusually large requests |
+| `multipart_without_boundary` | generic | - | A multipart request has no boundary | Malformed or crafted requests |
+| `empty_boundary` | generic | - | The Content-Type of a multipart request contains `boundary=` with an empty value | Sent by a published screening tool. Browsers and common HTTP libraries never send it. |
+| `repeated_char_boundary` | generic | - | The multipart boundary consists of one character other than `-`, repeated at least eight times | Observed in the confirmed exploit chain. Easy to change. |
+| `bare_lf_multipart` | generic | - | A multipart delimiter line or header block contains a line break without CR | Sent by a published screening tool. Browsers always send CRLF. |
+| `malformed_content_disposition` | generic | - | A `Content-Disposition` does not start with `form-data`, or a part header has continuation lines | PHP accepts both, browsers send neither. Hides field and file names from simple parsers. |
+| `upload_progress_without_user_agent` | generic | - | `upload_progress_field` matched and the request has no User-Agent | The confirmed exploit chain and several scanners send no User-Agent |
+| `scanner_user_agent` | generic | - | The User-Agent matches `scanner_user_agent_regex` | Self-named version checkers. These are scans, not exploits. |
+| `other_campaign_marker` | generic | - | The Content-Type contains a string from `other_content_type_markers` | Other campaigns with a similar request shape (for example `wp2shell`), logged to separate them from PHP2Shell |
+| `react2shell_lookalike` | generic | - | The request has a `Next-Action` header | React2Shell requests (Next.js Server Actions), which also use chunked multipart bodies |
+
+The thresholds are configured in the `[rules]` section of `config.ini`. The rules with the rule
+level `php2shell` are defined in `PHP2SHELL_RULES` in `monitor.py`. Options added after the first
 release have default values, so existing `config.ini` files continue to work.
 
 `chunked_multipart` requires the header `X-Php2shell-Transfer-Encoding`, which is set in
 `nginx/php2shell-mirror.conf`. Update the snippet on existing installations.
 
-Multipart bodies are parsed like PHP does: lines may end with CRLF or LF only, the boundary may
-be empty, `name=` and `filename=` are also found directly after the colon of `Content-Disposition`,
-and continuation lines are joined before the search.
+Multipart bodies are parsed with the variants that PHP accepts: lines may end with CRLF or LF
+only, the boundary may be empty, `name=` and `filename=` are also found directly after the colon
+of `Content-Disposition`, and continuation lines are joined before the search. The handling of an
+empty boundary is derived from the behavior of a published screening tool and has not been
+compared with the PHP parser in detail.
 
 `session_name` and `upload_progress_marker` must match the values of `session.name` and
 `session.upload_progress.name` in `php.ini` or the php-fpm pool. A session name that the
@@ -150,21 +163,21 @@ Modified exploits may not be detected. Pull requests with additional indicators 
 
 ## Output
 
-- **Console and log file:** one `HIT` line with details for each suspicious request, and a
-  `STATUS` line every `stats_interval` seconds. If the number of checked POST requests in the
-  `STATUS` line does not increase, nginx does not send any copies.
+- **Console and log file:** one `HIT` line with details for each suspicious request, a `STATUS`
+  line every `stats_interval` seconds, and `HOOK`, `WARNING` and `ERROR` lines. If the number of
+  checked POST requests in the `STATUS` line does not increase, nginx does not send any copies.
 - **`captures/`** (directory permissions 0700, file permissions 0600):
   - `2026-10-22_15-04-05_php2shell_203.0.113.7_123f550a1b.req` (date, level, IP, hash): request
     line, headers as forwarded by nginx, an empty line and the complete, unmodified body.
-  - A `.json` file with the same name: time, level, IP, host, URL, size, SHA-256 and the matched
-    rules.
+  - A `.json` file with the same name: time, request level, IP, host, URL, Content-Type, size,
+    SHA-256, nginx request ID and the matched rules.
   - If the same IP sends the same body again, the request is logged but not stored again.
   - When the directory reaches `max_total_mb`, only `.json` files are written. Files are never
     deleted automatically.
 - **Event log** (`events_file`): one JSON object per line for each suspicious request, including
   repeated requests. The file can easily be processed by other scripts.
 - **Email** (optional): configured with `[mail] to`. At most one email per IP is sent within
-  `min_interval`.
+  `min_interval`. Repeated requests do not send an email.
 - **Hook** (optional): a command that is run for each suspicious request, for example to block
   the IP address in the firewall. See [Hook](#hook).
 
@@ -182,11 +195,12 @@ as one JSON object, the same as in the event log:
 ```
 
 - The command is started without a shell. Request data is never inserted into the command line.
-  All fields except `time`, `level`, `rules`, `body_bytes`, `capture` and `repeat` are sent by
-  the client and must be treated as untrusted input. The monitor checks that `ip` is a valid IP
-  address before it runs the command.
+  `host`, `path` and `user_agent` are sent by the client and must be treated as untrusted input.
+  `ip` is set by nginx (`$remote_addr`), and the monitor checks that it is a valid IP address
+  before it runs the command. `method` is always `POST`.
 - The commands run one after another in a separate thread with a maximum run time of `timeout`
-  seconds. A slow command does not delay the inspection of further requests.
+  seconds. A slow command does not delay the inspection of further requests. If `queue_size`
+  events are waiting, further events are dropped and a warning is logged.
 - At most one command per IP is run within `min_interval` seconds. Repeated requests are not
   skipped, so that an IP address whose block has expired is blocked again.
 - Output of the command is written to the log (`HOOK` line). A non-zero exit code or a timeout
@@ -250,6 +264,11 @@ Choose `min_level` according to your risk assessment. `php2shell-chain` blocks o
 exploit attempts. `php2shell` also blocks scanners that send a single PHP2Shell-specific request.
 `generic` is not recommended, because these rules also match requests of regular visitors.
 
+> [!WARNING]
+> `test_requests.py` sends requests with the request level `php2shell`. If the hook is enabled,
+> running it through nginx blocks your own IP address. Add your address to the `ALLOWLIST` first,
+> or test before you enable the hook.
+
 ## Installation
 
 Requirements: nginx with php-fpm and Python 3.8 or later (tested with 3.9 and 3.12). The monitor
@@ -264,7 +283,7 @@ sudo cp config.example.ini config.ini
 ```
 
 Edit `config.ini`. Set the directories for captures and logs, add upload paths of your application
-to `large_body_ignore_paths` and, if required, an email address. `config.ini` is not tracked by
+to `large_body_ignore_paths` and, if required, an email address or a hook (see [Hook](#hook)). `config.ini` is not tracked by
 git, so `git pull` does not overwrite it. After an update, check `config.example.ini` for new
 options.
 
@@ -331,7 +350,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ```
 
 Test the setup through nginx. The detected requests must show your own IP address, not the IP
-address sent by the script:
+address sent by the script. If the hook is enabled, read the warning in [Hook](#hook) first:
 
 ```bash
 python3 test_requests.py --url https://example.com
@@ -380,6 +399,14 @@ longer needed, and check whether the operation complies with your data protectio
 - [darkfibr/php2shell-detect: request signatures](https://github.com/darkfibr/php2shell-detect)
 - [Telekom Security: PHP2Shell honeypot observations](https://github.security.telekom.com/2026/10/php2shell-honeypot-observations.html)
 - [SOCRadar: PHP2Shell exploit tooling on an exposed attacker server](https://socradar.io/blog/php2shell-exploit-tooling-attacker-server/)
+- [VulnCheck: PHP2Shell vulnerabilities](https://www.vulncheck.com/blog/php2shell-vulnerabilities)
+- [Zscaler ThreatLabz: CVE-2026-109618 and CVE-2026-109619](https://www.zscaler.com/blogs/security-research/cve-2026-109618-and-cve-2026-109619-php-vulnerable-unauthenticated-rce)
+- [Upwind: initial assessment of PHP2Shell](https://www.upwind.io/feed/initial-assessment-php2shell-two-critical-unpatched-php-rces-cve-2026-109618-cve-2026-109619)
+- [Imunify360: PHP2Shell](https://blog.imunify360.com/php-cve-2026-109618-cve-2026-109619/)
+- [CISA: Sigma rule for PHP2Shell](https://github.com/cisagov/SIGMA_Rules/blob/develop/CISA_SIGMA_261429_CVE_2026_109618-109619_PHP2Shell_TLP_CLEAR.yaml)
+- [0x4d31/honeypot-data: confirmed RCE in a honeypot](https://github.com/0x4d31/honeypot-data/blob/main/reports/php2shell/2026-10-24-confirmed-rce.md)
+- [assetnote/php2shell-scanner: screening tool](https://github.com/assetnote/php2shell-scanner)
+- [Defused: upload progress probes](https://x.com/DefusedCyber/status/2114241665972011513)
 
 ## Changelog
 
@@ -389,9 +416,9 @@ Upgrade notes:
 
 - Copy `nginx/php2shell-mirror.conf` to `/etc/nginx/snippets/` again and reload nginx. The
   snippet now passes the original `Transfer-Encoding` header, which `chunked_multipart` requires.
-- Compare your `config.ini` with `config.example.ini`. New options have default values, but the
-  default lists of tool markers in `config.example.ini` are only used if the option is missing in
-  `config.ini`. The default of `max_fields` is now 500 (before: 1000).
+- Compare your `config.ini` with `config.example.ini`. New options have default values and do
+  not have to be added. `max_fields` is set in existing `config.ini` files and keeps its old value
+  1000; set it to 500, the new value in `config.example.ini`.
 - `upload_progress_field` now matches only a multipart field with exactly the configured name.
   Other occurrences are reported as `upload_progress_text` with the level `generic`.
 
@@ -400,11 +427,11 @@ New:
 - Hook: optional command that receives each event as JSON on stdin (`[hook]` section), with
   example scripts in Python and PHP that block the IP address with nftables (`hooks/`).
 - Event log with one JSON object per line (`events_file`).
-- Level `php2shell-chain` for requests with the structure of a complete exploit chain.
+- Request level `php2shell-chain` for requests with the structure of a complete exploit chain.
   Fingerprints of the same tool count as one signal.
-- New `php2shell` rules: `multipart_header_flood`, `serialized_object_in_filename`,
+- New rules with the rule level `php2shell`: `multipart_header_flood`, `serialized_object_in_filename`,
   `exploit_tool_user_agent`, `exploit_tool_marker`, `probe_filename`, `empty_boundary_probe`.
-- New `generic` rules: `serialized_object_in_field`, `deep_nested_field_name`,
+- New rules with the rule level `generic`: `serialized_object_in_field`, `deep_nested_field_name`,
   `session_id_in_body`, `php_code_in_filename`, `long_filename`, `suspicious_filename`,
   `array_spray`, `chunked_multipart`, `empty_boundary`, `repeated_char_boundary`,
   `bare_lf_multipart`, `malformed_content_disposition`, `upload_progress_text`,
@@ -415,15 +442,13 @@ New:
 
 Changed:
 
-- Multipart bodies are parsed like PHP does: LF-only line breaks, empty boundaries,
+- Multipart bodies are parsed with the variants that PHP accepts: LF-only line breaks, empty boundaries,
   `Content-Disposition` without `form-data` and folded header lines are supported. Before, such
   bodies were not inspected or field and file names were not found.
-- The upload progress field and the session field are compared exactly and case-sensitively, as
-  PHP does.
-- The file name checks also apply to the field name of file parts, because PHP stores both in
-  the session.
-- `test_requests.py` no longer sends "php2shell" in the User-Agent and the boundary, so that the
-  clean test requests are not reported.
+- `upload_progress_field` compares the field name exactly and case-sensitively, as PHP does.
+  Before, the marker was searched anywhere in the body.
+- The `STATUS` line also counts requests with the request level `php2shell-chain`.
+- `test_requests.py` sends an additional request with LF-only line breaks.
 - README and comments revised.
 
 ### 2026-10-22
