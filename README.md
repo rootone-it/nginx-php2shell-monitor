@@ -12,8 +12,13 @@ checks the request body for the patterns of the known exploits and stores each s
 unchanged in a separate file. An event log with one JSON object per line can easily be processed
 by other scripts.
 
+The monitor is particularly useful **behind a web application firewall (WAF)**, for example the
+CrowdSec WAF or a CDN. Requests that the WAF blocks are not mirrored. The monitor therefore shows
+exactly the PHP2Shell requests that **get past your WAF** and reach PHP. See
+[Using the monitor with a WAF](#using-the-monitor-with-a-waf).
+
 **What's new (2026-10-28):** the monitor now supports hooks, for example to block the IP address
-of an attacker in the firewall (examples in Python and PHP for nftables included). It writes an
+of an attacker in the firewall (examples in Python and PHP for nftables and CrowdSec included). It writes an
 event log in JSON Lines format, rates complete exploit chains with the new request level
 `php2shell-chain`, parses the multipart variants that PHP accepts, and has many new detection rules based
 on the published exploit tools. Existing installations must update the nginx snippet. See the
@@ -30,7 +35,9 @@ Features:
 - Uses only the Python 3 standard library
 - Uses the nginx `mirror` module, which is included in nginx
 - The website is not affected if the daemon is stopped
+- Shows the PHP2Shell requests that get past a WAF
 - Optional hook command for each detection, for example to block the IP address in the firewall
+  or with CrowdSec
 
 ## Background
 
@@ -70,6 +77,36 @@ client ── POST ──> nginx ───────────────�
   which forwards POST requests to the daemon and ignores all other methods.
 - nginx passes the client IP in the header `X-Php2shell-Client-Ip`. Because `proxy_set_header`
   replaces a header with the same name sent by the client, the IP cannot be spoofed.
+
+## Using the monitor with a WAF
+
+nginx processes a request in phases. A WAF that is integrated into nginx, such as the CrowdSec
+nginx bouncer with AppSec, checks the request in the access phase and blocks it there. The
+`mirror` directive takes effect later, in the precontent phase, just before the request is passed
+to PHP. A WAF in front of nginx, such as a CDN, blocks the request before it reaches nginx at all.
+In both cases:
+
+- Requests blocked by the WAF are **not** mirrored. They appear in the logs of the WAF, not in the
+  monitor.
+- Requests allowed by the WAF are mirrored with their body. The monitor reports those that have
+  the structure of a PHP2Shell exploit. These are the requests that the WAF rules do not cover.
+
+WAF rules for PHP2Shell are usually written for specific variants. For example, the CrowdSec
+virtual patches for PHP2Shell block multipart requests with deeply nested field names, many file
+parts or the upload progress field. Other variants, such as the urlencoded request with a very
+long field name, are not described for these rules. The monitor shows whether such variants reach
+your server. Use both sources together: the WAF for blocked attempts, the monitor for attempts that
+got through.
+
+The mirrored copy is an nginx subrequest. nginx skips the access phase for subrequests, so the WAF
+does not inspect the copy a second time.
+
+After you enable a WAF, check that the monitor still receives the complete body. Send a regular,
+large POST request (for example an upload in the admin area of your application) and compare the
+size in the `.json` file of the monitor, or use a path that is not listed in
+`large_body_ignore_paths` and check the `large_body` hit. If you test with `test_requests.py`
+through nginx, add your IP address to the allowlist of the WAF first: the test requests are blocked
+by the WAF, and the WAF may block your IP address after several blocked requests.
 
 ## Detection rules
 
@@ -209,10 +246,16 @@ as one JSON object, the same as in the event log:
 
 ### Example: block the IP address with nftables
 
-`hooks/` contains the same example hook in Python (`php2shell-ban.py`) and PHP
-(`php2shell-ban.php`). Both add the IP address to an nftables set for 24 hours
-(`BAN_TIMEOUT`). Addresses on the `ALLOWLIST` in the script are never blocked; add the addresses
-of your own servers, monitoring and office there.
+`hooks/` contains two example hooks, each in Python and PHP:
+
+- `php2shell-ban.py` / `php2shell-ban.php`: add the IP address to an nftables set for 24 hours
+  (`BAN_TIMEOUT`).
+- `php2shell-ban-crowdsec.py` / `php2shell-ban-crowdsec.php`: add a CrowdSec ban decision for
+  24 hours (`BAN_DURATION`). See [Example: block the IP address with
+  CrowdSec](#example-block-the-ip-address-with-crowdsec).
+
+Addresses on the `ALLOWLIST` in the scripts are never blocked; add the addresses of your own
+servers, monitoring and office there.
 
 1. Load the nftables table, which drops packets from the blocked addresses:
 
@@ -260,6 +303,35 @@ of your own servers, monitoring and office there.
    sudo nft list set inet php2shell blocked4
    sudo nft delete element inet php2shell blocked4 '{ 192.0.2.1 }'
    ```
+
+### Example: block the IP address with CrowdSec
+
+If CrowdSec is installed, the hook can add a decision instead of an nftables entry. All CrowdSec
+remediation components then block the IP address, for example the firewall bouncer, the nginx
+bouncer and the CrowdSec WAF. No separate nftables table is needed.
+
+1. Install one of the scripts as root, so that the monitor user can run it but cannot change it:
+
+   ```bash
+   sudo install -o root -g root -m 0755 /opt/nginx-php2shell-monitor/hooks/php2shell-ban-crowdsec.py /usr/local/sbin/php2shell-ban
+   ```
+
+   For the PHP version, install `php2shell-ban-crowdsec.php` instead (requires the PHP CLI 7.4 or
+   later). The scripts call `/usr/bin/cscli`; change `CSCLI` if it is installed elsewhere.
+
+2. Allow the monitor user to run exactly this script as root, and configure the hook. Both steps
+   are the same as steps 3 and 4 of the nftables example.
+
+3. Test the script without the monitor:
+
+   ```bash
+   echo '{"ip": "192.0.2.1", "level": "php2shell", "rules": "test"}' | sudo -u php2shell sudo -n /usr/local/sbin/php2shell-ban
+   sudo cscli decisions list --ip 192.0.2.1
+   sudo cscli decisions delete --ip 192.0.2.1
+   ```
+
+The decisions have the reason `nginx-php2shell-monitor: <request level>` and appear in
+`cscli decisions list` and in the CrowdSec Console.
 
 Choose `min_level` according to your risk assessment. `php2shell-chain` blocks only complete
 exploit attempts. `php2shell` also blocks scanners that send a single PHP2Shell-specific request.
@@ -414,6 +486,8 @@ longer needed, and check whether the operation complies with your data protectio
 5. If you use the nftables example hook: delete the table (`sudo nft delete table inet php2shell`),
    the `include` line in `/etc/nftables.conf`, `/usr/local/sbin/php2shell-ban` and
    `/etc/sudoers.d/php2shell-ban`.
+6. If you use the CrowdSec example hook: delete `/usr/local/sbin/php2shell-ban` and
+   `/etc/sudoers.d/php2shell-ban`. Existing decisions expire automatically.
 
 ## References
 
@@ -436,6 +510,8 @@ longer needed, and check whether the operation complies with your data protectio
 - [0x4d31/honeypot-data: confirmed RCE in a honeypot](https://github.com/0x4d31/honeypot-data/blob/main/reports/php2shell/2026-10-24-confirmed-rce.md)
 - [assetnote/php2shell-scanner: screening tool](https://github.com/assetnote/php2shell-scanner)
 - [Defused: upload progress probes](https://x.com/DefusedCyber/status/2114241665972011513)
+- [CrowdSec: virtual patching for PHP2Shell](https://www.crowdsec.net/blog/php2shell-virtual-patching)
+- [CrowdSec documentation: virtual patching and CRS](https://docs.crowdsec.net/docs/v1.6/appsec/vpatch_and_crs)
 
 ## Changelog
 
@@ -457,7 +533,9 @@ Upgrade notes:
 New:
 
 - Hook: optional command that receives each event as JSON on stdin (`[hook]` section), with
-  example scripts in Python and PHP that block the IP address with nftables (`hooks/`).
+  example scripts in Python and PHP that block the IP address with nftables or CrowdSec
+  (`hooks/`).
+- README: use behind a WAF, such as the CrowdSec WAF.
 - Event log with one JSON object per line (`events_file`).
 - Minimum request level for emails (`[mail] min_level`).
 - Request level `php2shell-chain` for requests with the structure of a complete exploit chain.
