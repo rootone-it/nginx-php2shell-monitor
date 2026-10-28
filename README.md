@@ -345,6 +345,34 @@ Make the following changes in each server block you want to monitor (see
    usually redirects requests internally to `/index.php`. If both location blocks contain the
    `mirror` directive, each request is mirrored twice. Named locations (`@php`) are supported.
 
+Shortened example of a server block (the complete file is `nginx/example-site.conf`):
+
+```nginx
+server {
+    server_name example.com;
+    root /var/www/example.com/public;
+    ...
+
+    # nginx-php2shell-monitor: internal mirror location, once per server block
+    include /etc/nginx/snippets/php2shell-mirror.conf;
+
+    location / {
+        # no mirror here: try_files passes the request on to /index.php
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        # nginx-php2shell-monitor: only in location blocks with fastcgi_pass
+        mirror /__php2shell_monitor;
+        mirror_request_body on;
+
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        ...
+    }
+}
+```
+
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 ```
