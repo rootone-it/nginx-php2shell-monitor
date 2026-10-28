@@ -176,8 +176,9 @@ Modified exploits may not be detected. Pull requests with additional indicators 
     deleted automatically.
 - **Event log** (`events_file`): one JSON object per line for each suspicious request, including
   repeated requests. The file can easily be processed by other scripts.
-- **Email** (optional): configured with `[mail] to`. At most one email per IP is sent within
-  `min_interval`. Repeated requests do not send an email.
+- **Email** (optional): configured with `[mail] to`. Emails are only sent for requests with at
+  least the request level `min_level` (default `php2shell`). At most one email per IP is sent
+  within `min_interval`. Repeated requests do not send an email.
 - **Hook** (optional): a command that is run for each suspicious request, for example to block
   the IP address in the firewall. See [Hook](#hook).
 
@@ -449,12 +450,16 @@ Upgrade notes:
   1000; set it to 500, the new value in `config.example.ini`.
 - `upload_progress_field` now matches only a multipart field with exactly the configured name.
   Other occurrences are reported as `upload_progress_text` with the level `generic`.
+- Emails are only sent for requests with at least the request level `php2shell` (new option
+  `[mail] min_level`). Set `min_level = generic` to receive emails for all suspicious requests
+  as before.
 
 New:
 
 - Hook: optional command that receives each event as JSON on stdin (`[hook]` section), with
   example scripts in Python and PHP that block the IP address with nftables (`hooks/`).
 - Event log with one JSON object per line (`events_file`).
+- Minimum request level for emails (`[mail] min_level`).
 - Request level `php2shell-chain` for requests with the structure of a complete exploit chain.
   Fingerprints of the same tool count as one signal.
 - New rules with the rule level `php2shell`: `multipart_header_flood`, `serialized_object_in_filename`,

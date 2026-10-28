@@ -601,16 +601,26 @@ class CaptureStore:
 # Email notification (optional)
 # ---------------------------------------------------------------------------
 
+# Order of the request levels, used for the minimum level of emails and of the
+# hook.
+LEVEL_ORDER = ("generic", "php2shell", "php2shell-chain")
+
+
 class Mailer:
-    def __init__(self, to, sender, min_interval, log):
+    def __init__(self, to, sender, min_level, min_interval, log):
         self.to = to
         self.sender = sender
+        self.min_level = LEVEL_ORDER.index(min_level)
         self.min_interval = min_interval
         self.log = log
         self.last_by_ip = {}
 
     def notify(self, req, findings, capture_name):
         if not self.to:
+            return
+        # Checked before the interval, so that a request below the minimum
+        # level does not suppress the email of a following request.
+        if LEVEL_ORDER.index(request_level(findings)) < self.min_level:
             return
         now = time.time()
         if now - self.last_by_ip.get(req["ip"], 0) < self.min_interval:
@@ -646,9 +656,6 @@ class Mailer:
 # ---------------------------------------------------------------------------
 # Hook command (optional)
 # ---------------------------------------------------------------------------
-
-# Order of the request levels, used for the minimum level of the hook.
-LEVEL_ORDER = ("generic", "php2shell", "php2shell-chain")
 
 
 class Hook:
@@ -902,8 +909,11 @@ def main():
         m.strip() for m in cfg.get("rules", "other_content_type_markers", fallback="wp2shell").split(",") if m.strip()]
 
     store = CaptureStore(cfg.get("capture", "dir"), cfg.getint("capture", "max_total_mb") * 1048576, log)
+    mail_level = cfg.get("mail", "min_level", fallback="php2shell").strip()
+    if mail_level not in LEVEL_ORDER:
+        sys.exit("Invalid [mail] min_level: %s (allowed: %s)" % (mail_level, ", ".join(LEVEL_ORDER)))
     mailer = Mailer(cfg.get("mail", "to", fallback="").strip(), cfg.get("mail", "from").strip(),
-                    cfg.getint("mail", "min_interval"), log)
+                    mail_level, cfg.getint("mail", "min_interval"), log)
     # The [hook] section is optional, so that older config.ini files keep working.
     hook_level = cfg.get("hook", "min_level", fallback="php2shell").strip()
     if hook_level not in LEVEL_ORDER:
