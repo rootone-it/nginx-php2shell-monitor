@@ -27,8 +27,8 @@ import argparse
 import http.client
 import urllib.parse
 
-# Boundary and User-Agent must not contain "php2shell", because that is a
-# configured tool marker.
+# Boundary and User-Agent must not contain "p2shell" (or "php2shell"), because
+# that is a configured tool marker.
 BOUNDARY = "----selftestboundary7f3a"
 
 

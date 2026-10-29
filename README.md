@@ -1,28 +1,24 @@
 # nginx-php2shell-monitor
 
-Detection of **PHP2Shell** exploitation attempts (CVE-2026-109618, CVE-2026-109619) on servers
-running nginx and PHP-FPM. PHP2Shell refers to two critical remote code execution (RCE)
-vulnerabilities in PHP. nginx-php2shell-monitor inspects the HTTP POST request body of every
-request passed to PHP, detects the known exploit patterns and stores suspicious requests for
-analysis. It works with any PHP application, for example WordPress, Laravel, Symfony, Shopware or
-Magento.
+Passive detection of PHP2Shell exploitation attempts (CVE-2026-109618, CVE-2026-109619) for nginx
+and PHP-FPM, built on the `mirror` module included in nginx. Nothing is placed in the request
+path.
 
-nginx sends a copy of each POST request to a Python daemon listening on `127.0.0.1`. The daemon
-checks the request body for the patterns of the known exploits and stores each suspicious request
-unchanged in a separate file. An event log with one JSON object per line can easily be processed
-by other scripts.
+PHP2Shell exploits are sent in the POST body, which access logs never record. nginx sends a copy
+of each POST request that reaches PHP to a small daemon on `127.0.0.1`. The daemon answers
+immediately, nginx discards the answer, and the site keeps working even when the daemon is
+stopped. Suspicious requests are stored unchanged, written to a JSON Lines event log and can
+trigger a hook, for example to block the IP address with nftables or CrowdSec.
 
-The monitor is particularly useful **behind a web application firewall (WAF)**, for example the
-CrowdSec WAF or a CDN. Requests that the WAF blocks are not mirrored. The monitor therefore shows
-exactly the PHP2Shell requests that **get past your WAF** and reach PHP. See
+**Behind a WAF, it shows exactly the PHP2Shell requests that got past it.** See
 [Using the monitor with a WAF](#using-the-monitor-with-a-waf).
 
-**What's new (2026-10-28):** the monitor now supports hooks, for example to block the IP address
-of an attacker in the firewall (examples in Python and PHP for nftables and CrowdSec included). It writes an
-event log in JSON Lines format, rates complete exploit chains with the new request level
-`php2shell-chain`, parses the multipart variants that PHP accepts, and has many new detection rules based
-on the published exploit tools. Existing installations must update the nginx snippet. See the
-[Changelog](#changelog) for details.
+- No proxy, no nginx module to compile, no change to responses
+- Fail-open: a stopped or crashed daemon never affects the website
+- Python 3 standard library only
+- Works with any PHP application (WordPress, Laravel, Symfony, Shopware, Magento)
+
+→ [Installation](#installation) · [How it works](#how-it-works) · [Changelog](#changelog)
 
 > [!IMPORTANT]
 > **This tool detects attacks, it does not fix the vulnerability.** It cannot block the inspected
@@ -30,14 +26,8 @@ on the published exploit tools. Existing installations must update the nginx sni
 > requests. To fix PHP2Shell, update PHP to 8.2.35, 8.3.36, 8.4.27 or 8.5.12 (or install the
 > patched package of your distribution) and restart php-fpm.
 
-Features:
-
-- Uses only the Python 3 standard library
-- Uses the nginx `mirror` module, which is included in nginx
-- The website is not affected if the daemon is stopped
-- Shows the PHP2Shell requests that get past a WAF
-- Optional hook command for each detection, for example to block the IP address in the firewall
-  or with CrowdSec
+Latest update (2026-10-29): new tool fingerprints from honeypot reports and fewer misattributions
+of other campaigns. See the [Changelog](#changelog).
 
 ## Background
 
@@ -59,6 +49,7 @@ The published analyses describe two attack methods:
   multipart POST request containing the field `PHP_SESSION_UPLOAD_PROGRESS`.
 
 Web server access logs do not contain request bodies and cannot be used to detect these attacks.
+This is why the monitor needs a copy of the request with its body.
 
 ## How it works
 
@@ -143,8 +134,8 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `upload_progress_field` | php2shell | trigger, signal | A multipart field is named exactly `upload_progress_marker` (case-sensitive, as compared by PHP) | CVE-2026-109619 and other upload progress variants. Applications with an upload progress bar send this field legitimately. |
 | `multipart_header_flood` | php2shell | signal | A multipart part has more than `max_part_headers` header lines or a duplicate header name | CVE-2026-109618: memory amplification closed by the PHP fix |
 | `serialized_object_in_filename` | php2shell | payload, signal | An upload file name or the field name of a file part contains a serialized PHP object or array | Session injection through the upload progress handler, which stores both names |
-| `exploit_tool_user_agent` | php2shell | signal (shared) | The User-Agent matches `tool_user_agent_regex` | User-Agent of published exploit tools. This is a weak indicator: most tool requests do not send it, and it is easy to change. Boundary markers are more stable. |
-| `exploit_tool_marker` | php2shell | signal (shared) | The body or the Content-Type contains a string from `tool_markers`, or the Content-Type contains a string from `tool_content_type_markers` | Fixed strings and multipart boundaries of published exploit tools |
+| `exploit_tool_user_agent` | php2shell | signal (shared) | The User-Agent matches `tool_user_agent_regex` | User-Agent of published exploit tools (for example `php2shell-109618`, `php2shell-verify/1.0`, `B8RAT/1.0`). This is a weak indicator: most tool requests do not send it, and it is easy to change. Boundary markers are more stable. |
+| `exploit_tool_marker` | php2shell | signal (shared) | The body or the Content-Type contains a string from `tool_markers`, or the Content-Type contains a string from `tool_content_type_markers`. Strings from `other_content_type_markers` are removed from the Content-Type first. | Fixed strings and multipart boundaries of published exploit tools. `p2shell` matches the boundaries of several tools, including those with `php2shell`. |
 | `probe_filename` | php2shell | payload, signal | An upload file name matches `tool_filename_regex` | File names of published screening tools for session injection |
 | `empty_boundary_probe` | php2shell | signal | `empty_boundary` together with `large_body` or `deep_nested_field_name` | Memory exhaustion probe of a published screening tool, also with a replaced User-Agent |
 | `empty_field_name` | generic | - | A urlencoded field has no name | Part of CVE-2026-109618, also used by bots |
@@ -153,7 +144,7 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `deep_nested_field_name` | generic | - | A field name has more than `max_field_nesting` array levels | Observed in requests with up to 200 levels |
 | `session_id_in_body` | generic | payload | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
 | `php_code_in_filename` | generic | payload | An upload file name or the field name of a file part contains `<?` | Session injection, also used in other upload attacks |
-| `suspicious_filename` | generic | payload | An upload file name matches `suspicious_filename_regex` | Short file names from exploit chains (for example `p2s.txt`) that regular visitors could also use. |
+| `suspicious_filename` | generic | payload | An upload file name matches `suspicious_filename_regex` | Short file names from exploit chains and probes (`p2s.txt`, `probe.txt`, `a.txt`, `t.txt`, `x.txt`) that regular visitors could also use. Together with `upload_progress_field`, such a probe receives the request level `php2shell-chain`. |
 | `upload_progress_text` | generic | - | The body contains `upload_progress_marker` (any case, plain or URL-encoded), but no multipart field has exactly this name | No effect in PHP. Scans with a wrong spelling, or free text such as a support request about the vulnerability. |
 | `long_filename` | generic | - | An upload file name is longer than `max_filename_length` | Session inflation through the upload progress handler |
 | `array_spray` | generic | payload | At least `max_same_array_fields` fields have the same array name (for example `t[]`) | Sent by a published exploit tool. The purpose of these fields is unverified. |
@@ -165,9 +156,9 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `repeated_char_boundary` | generic | - | The multipart boundary consists of one character other than `-`, repeated at least eight times | Observed in the confirmed exploit chain. Easy to change. |
 | `bare_lf_multipart` | generic | - | A multipart delimiter line or header block contains a line break without CR | Sent by a published screening tool. Browsers always send CRLF. |
 | `malformed_content_disposition` | generic | - | A `Content-Disposition` does not start with `form-data`, or a part header has continuation lines | PHP accepts both, browsers send neither. Hides field and file names from simple parsers. |
-| `upload_progress_without_user_agent` | generic | - | `upload_progress_field` matched and the request has no User-Agent | The confirmed exploit chain and several scanners send no User-Agent |
+| `upload_progress_without_user_agent` | generic | - | `upload_progress_field` matched and the request has no User-Agent, or the User-Agent is the literal string `None` | The confirmed exploit chain and several scanners send no User-Agent. Some Python tools send `None`. |
 | `scanner_user_agent` | generic | - | The User-Agent matches `scanner_user_agent_regex` | Self-named version checkers. These are scans, not exploits. |
-| `other_campaign_marker` | generic | - | The Content-Type contains a string from `other_content_type_markers` | Other campaigns with a similar request shape (for example `wp2shell`), logged to separate them from PHP2Shell |
+| `other_campaign_marker` | generic | - | The Content-Type contains a string from `other_content_type_markers` | Other campaigns with a similar request shape, logged to separate them from PHP2Shell: `wp2shell`, and `php2shell-golang`, a session poisoning tool that does not exploit the PHP2Shell vulnerabilities |
 | `react2shell_lookalike` | generic | - | The request has a `Next-Action` header | React2Shell requests (Next.js Server Actions), which also use chunked multipart bodies |
 
 The thresholds are configured in the `[rules]` section of `config.ini`. The rules with the rule
@@ -467,6 +458,9 @@ The test requests are sent to your application and receive its normal responses 
 - Requests larger than `client_max_body_size` are rejected with status 413 before they are
   mirrored. These requests appear only in the access log.
 - Requests rejected by access rules (`allow`/`deny`, authentication) are not mirrored.
+- Requests whose body is never completed are not mirrored, because nginx sends the copy only
+  after it has read the complete body. Some tools announce a large body, send a few bytes and keep
+  the connection open. These requests appear only in the access log and the error log of nginx.
 - Only POST requests are inspected, because PHP parses only POST request bodies automatically.
 
 ## Privacy
@@ -510,10 +504,43 @@ longer needed, and check whether the operation complies with your data protectio
 - [0x4d31/honeypot-data: confirmed RCE in a honeypot](https://github.com/0x4d31/honeypot-data/blob/main/reports/php2shell/2026-10-24-confirmed-rce.md)
 - [assetnote/php2shell-scanner: screening tool](https://github.com/assetnote/php2shell-scanner)
 - [Defused: upload progress probes](https://x.com/DefusedCyber/status/2114241665972011513)
+- [OffSeq: PHP2Shell in the wild, the first 48 hours on a honeypot fleet](https://offseq.com/en/research/php2shell-first-48-hours/)
+- [F5 Labs: PHP2Shell exploitation attempts observed](https://www.f5.com/labs/articles/php2shell-exploitation-attempts-observed)
+- [Wiz: PHP2Shell exploitation attempts and remediation trends](https://www.wiz.io/blog/php2shell-exploitation-so-far)
 - [CrowdSec: virtual patching for PHP2Shell](https://www.crowdsec.net/blog/php2shell-virtual-patching)
 - [CrowdSec documentation: virtual patching and CRS](https://docs.crowdsec.net/docs/v1.6/appsec/vpatch_and_crs)
 
 ## Changelog
+
+### 2026-10-29
+
+Upgrade notes:
+
+- Compare your `config.ini` with `config.example.ini`. The changed defaults below only take effect
+  if the options are missing from `config.ini`. Existing `config.ini` files keep their old values.
+  Update `tool_user_agent_regex`, `tool_content_type_markers`, `other_content_type_markers` and
+  `suspicious_filename_regex` there.
+- Restart the monitor. The nginx snippet is unchanged.
+
+New:
+
+- Tool marker `p2shell` in `tool_content_type_markers`. It replaces `php2shell`, which it also
+  matches. Boundaries of the form `p2shell` plus hex characters were observed in honeypots and
+  were not matched before.
+- Tool marker `CHKBND` (boundary of a manual check script) and tool User-Agent `B8RAT/`.
+- `php2shell-golang` in `other_content_type_markers`: boundary of a session poisoning tool that
+  does not exploit the PHP2Shell vulnerabilities.
+- `suspicious_filename_regex` also matches `probe.txt`, `a.txt`, `t.txt` and `x.txt`, which
+  published probes upload together with the upload progress field.
+- README: a limitation is described: requests whose body is never completed are not mirrored.
+
+Changed:
+
+- Strings from `other_content_type_markers` are removed from the Content-Type before the tool
+  markers are searched. Before, a short tool marker could match a part of them (`wp2shell`
+  contains `p2shell`).
+- `upload_progress_without_user_agent` also matches the literal User-Agent `None`.
+- README: new introduction.
 
 ### 2026-10-28
 

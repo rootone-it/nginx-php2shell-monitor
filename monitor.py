@@ -306,24 +306,29 @@ def analyze(req, rules):
     if rules["scanner_user_agent_re"] and rules["scanner_user_agent_re"].search(req["user_agent"]):
         findings.append({"rule": "scanner_user_agent",
                          "detail": "User-Agent '%s'" % req["user_agent"][:100]})
+    # Markers of other campaigns with a similar request shape (for example
+    # "wp2shell"). They are only logged to separate them from PHP2Shell.
+    # They are removed from the Content-Type before the tool markers are
+    # searched, because a short tool marker can be part of them: "wp2shell"
+    # contains the tool marker "p2shell".
+    tool_content_type = content_type
+    for other_marker in rules["other_content_type_markers"]:
+        if other_marker.lower() in content_type:
+            findings.append({"rule": "other_campaign_marker",
+                             "detail": "'%s' found in Content-Type" % other_marker})
+            tool_content_type = tool_content_type.replace(other_marker.lower(), "")
     for tool_marker in rules["tool_markers"]:
         needle = tool_marker.lower().encode()
-        if needle in lower_body or needle in content_type.encode():
+        if needle in lower_body or needle in tool_content_type.encode():
             findings.append({"rule": "exploit_tool_marker",
                              "detail": "'%s' found in request" % tool_marker})
     # Markers that are only searched in the Content-Type header (multipart
     # boundaries of exploit tools). Words like "php2shell" can also appear in
     # regular form text, for example in a support request about the vulnerability.
     for tool_marker in rules["tool_content_type_markers"]:
-        if tool_marker.lower() in content_type:
+        if tool_marker.lower() in tool_content_type:
             findings.append({"rule": "exploit_tool_marker",
                              "detail": "'%s' found in Content-Type" % tool_marker})
-    # Markers of other campaigns with a similar request shape (for example
-    # "wp2shell"). They are only logged to separate them from PHP2Shell.
-    for other_marker in rules["other_content_type_markers"]:
-        if other_marker.lower() in content_type:
-            findings.append({"rule": "other_campaign_marker",
-                             "detail": "'%s' found in Content-Type" % other_marker})
 
     # Next.js Server Actions header used by React2Shell. These requests also
     # use chunked multipart bodies and are separated from PHP2Shell this way.
@@ -384,7 +389,9 @@ def analyze(req, rules):
                              "detail": "multipart field '%s'" % rules["upload_progress_marker"]})
             # The confirmed exploit chain and several published scanners send
             # no User-Agent. Browsers with an upload progress bar always send one.
-            if not req["user_agent"].strip():
+            # Some Python tools send the literal string "None" instead, when the
+            # header value is not set.
+            if req["user_agent"].strip() in ("", "None"):
                 findings.append({"rule": "upload_progress_without_user_agent",
                                  "detail": "multipart field '%s', no User-Agent" % rules["upload_progress_marker"]})
             upload_progress_text = False
@@ -889,24 +896,27 @@ def main():
         ).split(",") if m.strip()],
         "tool_content_type_markers": [m.strip() for m in cfg.get(
             "rules", "tool_content_type_markers",
-            fallback="p2sBoundary, php2shell, p2s9rdme2st6guc9g0rafic, SCANBOUND, WRITEBOUND, NeoMM2026, "
-                     "BNDRY12345, BGCTXBOUNDARY"
+            fallback="p2sBoundary, p2shell, p2s9rdme2st6guc9g0rafic, SCANBOUND, WRITEBOUND, NeoMM2026, "
+                     "BNDRY12345, BGCTXBOUNDARY, CHKBND"
         ).split(",") if m.strip()],
         "max_field_nesting": cfg.getint("rules", "max_field_nesting", fallback=32),
     }
-    tool_ua = cfg.get("rules", "tool_user_agent_regex", fallback="php2shell").strip()
+    tool_ua = cfg.get("rules", "tool_user_agent_regex", fallback="php2shell|^B8RAT/").strip()
     rules["tool_user_agent_re"] = re.compile(tool_ua, re.IGNORECASE) if tool_ua else None
     tool_filename = cfg.get(
         "rules", "tool_filename_regex",
         fallback=r"^MARKER_[0-9a-f]{8}|^___PHP2SHELL_PROBE_[0-9a-f]{8}___$").strip()
     rules["tool_filename_re"] = re.compile(tool_filename.encode(), re.IGNORECASE) if tool_filename else None
-    suspicious_filename = cfg.get("rules", "suspicious_filename_regex", fallback=r"^p2s\.txt$").strip()
-    rules["suspicious_filename_re"] = re.compile(suspicious_filename.encode(), re.IGNORECASE)         if suspicious_filename else None
+    suspicious_filename = cfg.get("rules", "suspicious_filename_regex",
+                                  fallback=r"^(p2s|probe|[atx])\.txt$").strip()
+    rules["suspicious_filename_re"] = re.compile(suspicious_filename.encode(), re.IGNORECASE) \
+        if suspicious_filename else None
     scanner_ua = cfg.get("rules", "scanner_user_agent_regex",
                          fallback="Company-PHP-Audit|trap-test-rev|php-cve-version-check").strip()
     rules["scanner_user_agent_re"] = re.compile(scanner_ua, re.IGNORECASE) if scanner_ua else None
     rules["other_content_type_markers"] = [
-        m.strip() for m in cfg.get("rules", "other_content_type_markers", fallback="wp2shell").split(",") if m.strip()]
+        m.strip() for m in cfg.get("rules", "other_content_type_markers",
+                                   fallback="wp2shell, php2shell-golang").split(",") if m.strip()]
 
     store = CaptureStore(cfg.get("capture", "dir"), cfg.getint("capture", "max_total_mb") * 1048576, log)
     mail_level = cfg.get("mail", "min_level", fallback="php2shell").strip()
