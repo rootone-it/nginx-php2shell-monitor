@@ -122,6 +122,68 @@ SERIALIZED_RE = re.compile(rb'(?:\||^)[OCa]:\d+:')
 # values contain more free text than file names.
 SERIALIZED_VALUE_RE = re.compile(rb'(?:^|\|)(?:[OC]:\d+:"|a:\d+:\{)')
 
+# Thresholds derived from the published exploits. Regular forms stay far below
+# them, so they do not depend on the monitored site and are not configurable.
+# The thresholds that depend on the site (max_fields, large_body_bytes) are set
+# in config.ini.
+
+# Field name length in bytes. The known CVE-2026-109618 exploit uses about 3.5 MB.
+MAX_FIELD_NAME_LENGTH = 1024
+# Header lines in one multipart part. Browsers send two or three. Duplicate
+# header names in a part are always reported.
+MAX_PART_HEADERS = 10
+# Upload file name length in bytes.
+MAX_FILENAME_LENGTH = 1024
+# Fields with the same array name, e.g. "t[]". A published PoC sends 149.
+MAX_SAME_ARRAY_FIELDS = 100
+# Array levels in a field name, e.g. a[b][c] has two. Observed in requests with
+# up to 200 levels (PHP default for max_input_nesting_level: 64).
+MAX_FIELD_NESTING = 32
+
+# Fingerprints of published exploit and screening tools. They are part of the
+# rules and are updated with new releases. Additional markers can be added with
+# extra_tool_markers in config.ini.
+
+# User-Agents of exploit tools: php2shell-109618 / php2shell-109619 (number
+# incremented per request), php2shell-scan, php2shell-verify, php2shell-poc
+# (VulnCheck, F5, CISA Sigma rule), B8RAT/1.0 (OffSeq). A weak indicator: most
+# tool requests do not send such a User-Agent.
+TOOL_USER_AGENT_RE = re.compile(r'php2shell|^B8RAT/', re.IGNORECASE)
+
+# User-Agents of self-named version checkers. They are scanners, not exploits,
+# and have the rule level generic.
+SCANNER_USER_AGENT_RE = re.compile(r'Company-PHP-Audit|trap-test-rev|php-cve-version-check', re.IGNORECASE)
+
+# Fixed strings of exploit tools, searched in the body and the Content-Type
+# (case-insensitive). p2s-rider: upload progress probes (Defused).
+TOOL_MARKERS = ("JACKALPOC", "B7kQpoc", "p2s-rider", "neosc4n", "neo_obj_inject", "sf618_",
+                "xqsuvwz3n97wu8j3emz1axuo5y")
+
+# Multipart boundaries of exploit tools, only searched in the Content-Type
+# (case-insensitive). Words like "php2shell" can also appear in regular form
+# text, for example in a support request about the vulnerability.
+# p2shell: boundaries "p2shell<hex>" of the most active actor (OffSeq) and
+# "----php2shell<hex>" (F5). CHKBND: manual check script (OffSeq).
+TOOL_CONTENT_TYPE_MARKERS = ("p2sBoundary", "p2shell", "p2s9rdme2st6guc9g0rafic", "SCANBOUND", "WRITEBOUND",
+                             "NeoMM2026", "BNDRY12345", "BGCTXBOUNDARY", "CHKBND")
+
+# Boundaries of other campaigns with a similar request shape, only searched in
+# the Content-Type. They are logged with the rule level generic to separate
+# them from PHP2Shell, and removed from the Content-Type before the tool
+# markers are searched: "wp2shell" contains the tool marker "p2shell".
+# php2shell-golang: session poisoning tool that does not exploit the PHP2Shell
+# vulnerabilities (Wiz).
+OTHER_CONTENT_TYPE_MARKERS = ("wp2shell", "php2shell-golang")
+
+# Upload file names of screening tools that test whether file names end up in
+# the session. Rule level php2shell.
+TOOL_FILENAME_RE = re.compile(rb'^MARKER_[0-9a-f]{8}|^___PHP2SHELL_PROBE_[0-9a-f]{8}___$', re.IGNORECASE)
+
+# Short upload file names of exploit chains and probes (F5, OffSeq) that regular
+# visitors could use as well. Rule level generic, but they count as payload for
+# the request level php2shell-chain together with the upload progress field.
+SUSPICIOUS_FILENAME_RE = re.compile(rb'^(p2s|probe|[atx])\.txt$', re.IGNORECASE)
+
 # Rules with the rule level "php2shell" (specific to PHP2Shell). All other
 # rules have the rule level "generic". A request receives the request level
 # "php2shell" if at least one of these rules matches, "php2shell-chain" under
@@ -135,6 +197,33 @@ PHP2SHELL_RULES = (
     "exploit_tool_marker",
     "probe_filename",
     "empty_boundary_probe",
+)
+
+# All other rules. Together with PHP2SHELL_RULES, these are the names allowed
+# in disabled_rules.
+GENERIC_RULES = (
+    "empty_field_name",
+    "nul_byte",
+    "serialized_object_in_field",
+    "deep_nested_field_name",
+    "session_id_in_body",
+    "php_code_in_filename",
+    "suspicious_filename",
+    "upload_progress_text",
+    "long_filename",
+    "array_spray",
+    "chunked_multipart",
+    "too_many_fields",
+    "large_body",
+    "multipart_without_boundary",
+    "empty_boundary",
+    "repeated_char_boundary",
+    "bare_lf_multipart",
+    "malformed_content_disposition",
+    "upload_progress_without_user_agent",
+    "scanner_user_agent",
+    "other_campaign_marker",
+    "react2shell_lookalike",
 )
 
 # The known exploit chains need two steps: a trigger that reaches the vulnerable
@@ -294,38 +383,29 @@ def analyze(req, rules):
     marker = rules["upload_progress_marker"].lower().encode()
     upload_progress_text = marker in lower_body or marker in decoded_body
 
-    # Fingerprints of published exploit tools: User-Agent (e.g. "php2shell-109619",
-    # the number is incremented per request) and fixed strings from the PoC
-    # (multipart boundary, command output marker). The User-Agent is a weak
-    # indicator, because most tool requests do not send it.
-    if rules["tool_user_agent_re"] and rules["tool_user_agent_re"].search(req["user_agent"]):
+    # Fingerprints of published tools, see TOOL_USER_AGENT_RE and the following
+    # constants.
+    if TOOL_USER_AGENT_RE.search(req["user_agent"]):
         findings.append({"rule": "exploit_tool_user_agent",
                          "detail": "User-Agent '%s'" % req["user_agent"][:100]})
-    # User-Agents of self-named version checkers. They are scanners and not
-    # exploits, therefore generic.
-    if rules["scanner_user_agent_re"] and rules["scanner_user_agent_re"].search(req["user_agent"]):
+    if SCANNER_USER_AGENT_RE.search(req["user_agent"]):
         findings.append({"rule": "scanner_user_agent",
                          "detail": "User-Agent '%s'" % req["user_agent"][:100]})
-    # Markers of other campaigns with a similar request shape (for example
-    # "wp2shell"). They are only logged to separate them from PHP2Shell.
-    # They are removed from the Content-Type before the tool markers are
-    # searched, because a short tool marker can be part of them: "wp2shell"
-    # contains the tool marker "p2shell".
+    # Markers of other campaigns are removed from the Content-Type before the
+    # tool markers are searched (see OTHER_CONTENT_TYPE_MARKERS).
     tool_content_type = content_type
-    for other_marker in rules["other_content_type_markers"]:
+    for other_marker in OTHER_CONTENT_TYPE_MARKERS:
         if other_marker.lower() in content_type:
             findings.append({"rule": "other_campaign_marker",
                              "detail": "'%s' found in Content-Type" % other_marker})
             tool_content_type = tool_content_type.replace(other_marker.lower(), "")
-    for tool_marker in rules["tool_markers"]:
+    # extra_tool_markers from config.ini are searched like TOOL_MARKERS.
+    for tool_marker in TOOL_MARKERS + rules["extra_tool_markers"]:
         needle = tool_marker.lower().encode()
         if needle in lower_body or needle in tool_content_type.encode():
             findings.append({"rule": "exploit_tool_marker",
                              "detail": "'%s' found in request" % tool_marker})
-    # Markers that are only searched in the Content-Type header (multipart
-    # boundaries of exploit tools). Words like "php2shell" can also appear in
-    # regular form text, for example in a support request about the vulnerability.
-    for tool_marker in rules["tool_content_type_markers"]:
+    for tool_marker in TOOL_CONTENT_TYPE_MARKERS:
         if tool_marker.lower() in tool_content_type:
             findings.append({"rule": "exploit_tool_marker",
                              "detail": "'%s' found in Content-Type" % tool_marker})
@@ -423,7 +503,7 @@ def analyze(req, rules):
             # different headers per part.
             header_count = len(p["header_names"])
             duplicates = header_count - len(set(p["header_names"]))
-            if header_count > rules["max_part_headers"] or duplicates > 0:
+            if header_count > MAX_PART_HEADERS or duplicates > 0:
                 findings.append({"rule": "multipart_header_flood",
                                  "detail": "part '%s' has %d header lines, %d duplicates" % (
                                      short(p["name"]), header_count, duplicates)})
@@ -453,17 +533,13 @@ def analyze(req, rules):
                     if b"<?" in value:
                         findings.append({"rule": "php_code_in_filename",
                                          "detail": "%s '%s'" % (label, short(value))})
-                if len(filename) > rules["max_filename_length"]:
+                if len(filename) > MAX_FILENAME_LENGTH:
                     findings.append({"rule": "long_filename",
                                      "detail": "filename has %d bytes" % len(filename)})
-                # File name patterns of published screening tools that test
-                # whether file names end up in the session.
-                if rules["tool_filename_re"] and rules["tool_filename_re"].search(filename):
+                if TOOL_FILENAME_RE.search(filename):
                     findings.append({"rule": "probe_filename",
                                      "detail": "filename '%s'" % short(filename)})
-                # File names from exploit chains that are short enough to be
-                # used by regular visitors as well (e.g. "p2s.txt").
-                if rules["suspicious_filename_re"] and rules["suspicious_filename_re"].search(filename):
+                if SUSPICIOUS_FILENAME_RE.search(filename):
                     findings.append({"rule": "suspicious_filename",
                                      "detail": "filename '%s'" % short(filename)})
 
@@ -475,7 +551,7 @@ def analyze(req, rules):
     if names:
         # Known CVE-2026-109618 exploit: field name of about 3.5 MB ending in [x].
         for name in names:
-            if len(name) > rules["max_field_name_length"]:
+            if len(name) > MAX_FIELD_NAME_LENGTH:
                 findings.append({"rule": "long_field_name",
                                  "detail": "field name has %d bytes, ends with '%s'" % (
                                      len(name), short(name[-40:]))})
@@ -488,7 +564,7 @@ def analyze(req, rules):
         # forms use fewer than five levels.
         for name in names:
             depth = name.count(b"[")
-            if depth > rules["max_field_nesting"]:
+            if depth > MAX_FIELD_NESTING:
                 findings.append({"rule": "deep_nested_field_name",
                                  "detail": "field name with %d levels" % depth})
 
@@ -497,7 +573,7 @@ def analyze(req, rules):
         counts = Counter(name for name in names if name.endswith(b"[]"))
         if counts:
             top_name, top_count = counts.most_common(1)[0]
-            if top_count >= rules["max_same_array_fields"]:
+            if top_count >= MAX_SAME_ARRAY_FIELDS:
                 findings.append({"rule": "array_spray",
                                  "detail": "%d fields named '%s'" % (top_count, short(top_name))})
 
@@ -516,6 +592,10 @@ def analyze(req, rules):
         findings.append({"rule": "empty_boundary_probe",
                          "detail": "empty boundary with %s" % ", ".join(sorted(
                              rules_hit.intersection(("large_body", "deep_nested_field_name"))))})
+
+    # Rules disabled in config.ini are removed only here, so that derived rules
+    # such as empty_boundary_probe still see them.
+    findings = [f for f in findings if f["rule"] not in rules["disabled_rules"]]
 
     # Merge repeated matches of the same rule (for example many NUL bytes).
     merged = OrderedDict()
@@ -866,6 +946,14 @@ def stats_loop(interval, stats, work_queue, log):
                      stats.level_generic, stats.saved, stats.duplicates, stats.dropped, work_queue.qsize()))
 
 
+OBSOLETE_RULE_OPTIONS = (
+    "max_field_name_length", "max_part_headers", "max_filename_length", "max_same_array_fields",
+    "max_field_nesting", "tool_user_agent_regex", "scanner_user_agent_regex", "tool_markers",
+    "tool_content_type_markers", "other_content_type_markers", "tool_filename_regex",
+    "suspicious_filename_regex",
+)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Detects PHP2Shell exploitation attempts in POST requests mirrored by nginx")
     parser.add_argument("-c", "--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini"))
@@ -879,7 +967,6 @@ def main():
     events = EventLog(cfg.get("log", "events_file", fallback="").strip())
 
     rules = {
-        "max_field_name_length": cfg.getint("rules", "max_field_name_length"),
         "max_fields": cfg.getint("rules", "max_fields"),
         "large_body_bytes": cfg.getint("rules", "large_body_bytes"),
         "large_body_ignore_paths": [p.strip() for p in cfg.get("rules", "large_body_ignore_paths").split(",") if p.strip()],
@@ -887,36 +974,14 @@ def main():
         # Options added after the first release have defaults, so that older
         # config.ini files keep working.
         "session_name": cfg.get("rules", "session_name", fallback="PHPSESSID").strip(),
-        "max_part_headers": cfg.getint("rules", "max_part_headers", fallback=10),
-        "max_filename_length": cfg.getint("rules", "max_filename_length", fallback=1024),
-        "max_same_array_fields": cfg.getint("rules", "max_same_array_fields", fallback=100),
-        "tool_markers": [m.strip() for m in cfg.get(
-            "rules", "tool_markers",
-            fallback="JACKALPOC, B7kQpoc, p2s-rider, neosc4n, neo_obj_inject, sf618_, xqsuvwz3n97wu8j3emz1axuo5y"
-        ).split(",") if m.strip()],
-        "tool_content_type_markers": [m.strip() for m in cfg.get(
-            "rules", "tool_content_type_markers",
-            fallback="p2sBoundary, p2shell, p2s9rdme2st6guc9g0rafic, SCANBOUND, WRITEBOUND, NeoMM2026, "
-                     "BNDRY12345, BGCTXBOUNDARY, CHKBND"
-        ).split(",") if m.strip()],
-        "max_field_nesting": cfg.getint("rules", "max_field_nesting", fallback=32),
+        "extra_tool_markers": tuple(m.strip() for m in cfg.get(
+            "rules", "extra_tool_markers", fallback="").split(",") if m.strip()),
+        "disabled_rules": {r.strip() for r in cfg.get(
+            "rules", "disabled_rules", fallback="").split(",") if r.strip()},
     }
-    tool_ua = cfg.get("rules", "tool_user_agent_regex", fallback="php2shell|^B8RAT/").strip()
-    rules["tool_user_agent_re"] = re.compile(tool_ua, re.IGNORECASE) if tool_ua else None
-    tool_filename = cfg.get(
-        "rules", "tool_filename_regex",
-        fallback=r"^MARKER_[0-9a-f]{8}|^___PHP2SHELL_PROBE_[0-9a-f]{8}___$").strip()
-    rules["tool_filename_re"] = re.compile(tool_filename.encode(), re.IGNORECASE) if tool_filename else None
-    suspicious_filename = cfg.get("rules", "suspicious_filename_regex",
-                                  fallback=r"^(p2s|probe|[atx])\.txt$").strip()
-    rules["suspicious_filename_re"] = re.compile(suspicious_filename.encode(), re.IGNORECASE) \
-        if suspicious_filename else None
-    scanner_ua = cfg.get("rules", "scanner_user_agent_regex",
-                         fallback="Company-PHP-Audit|trap-test-rev|php-cve-version-check").strip()
-    rules["scanner_user_agent_re"] = re.compile(scanner_ua, re.IGNORECASE) if scanner_ua else None
-    rules["other_content_type_markers"] = [
-        m.strip() for m in cfg.get("rules", "other_content_type_markers",
-                                   fallback="wp2shell, php2shell-golang").split(",") if m.strip()]
+    unknown_rules = rules["disabled_rules"].difference(PHP2SHELL_RULES + GENERIC_RULES)
+    if unknown_rules:
+        sys.exit("Unknown rule in [rules] disabled_rules: %s" % ", ".join(sorted(unknown_rules)))
 
     store = CaptureStore(cfg.get("capture", "dir"), cfg.getint("capture", "max_total_mb") * 1048576, log)
     mail_level = cfg.get("mail", "min_level", fallback="php2shell").strip()
@@ -963,6 +1028,15 @@ def main():
     log.write("START listening on %s:%d, captures in %s (%d MB used), email to: %s, hook: %s"
               % (host, port, store.dir, store.total_bytes // 1048576, mailer.to or "-",
                  " ".join(hook.command) if hook.command else "-"))
+    # Options removed on 2026-10-29. Their values are part of the rules now and
+    # are defined as constants in this file. A warning is logged, so that
+    # nobody assumes that an old setting is still in effect.
+    for option in OBSOLETE_RULE_OPTIONS:
+        if cfg.has_option("rules", option):
+            log.write("WARNING [rules] %s is no longer supported and is ignored, the built-in value is used "
+                      "(see Changelog 2026-10-29, second update). Remove it from %s." % (option, args.config))
+    if rules["disabled_rules"]:
+        log.write("WARNING rules disabled in config: %s" % ", ".join(sorted(rules["disabled_rules"])))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
