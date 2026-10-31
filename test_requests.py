@@ -62,6 +62,8 @@ TESTS = [
     ("multipart with LF-only lines, no form-data", "/contact", "multipart/form-data; boundary=" + BOUNDARY,
      ("--%s\nContent-Disposition:name=\"email\"\n\ntest@example.org\n--%s--\n" % (BOUNDARY, BOUNDARY)).encode(),
      "192.0.2.44"),
+    ("upload progress field, comma after boundary", "/login", "multipart/form-data; boundary=" + BOUNDARY + ",x",
+     multipart([("PHP_SESSION_UPLOAD_PROGRESS", b"x" * 64), ("file", b"y" * 256)]), "2001:db8::8"),
     ("upload progress field (repeat)", "/login", "multipart/form-data; boundary=" + BOUNDARY,
      multipart([("PHP_SESSION_UPLOAD_PROGRESS", b"x" * 64), ("file", b"y" * 128)]), "2001:db8::7"),
 ]

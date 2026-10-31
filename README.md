@@ -26,9 +26,31 @@ trigger a hook, for example to block the IP address with nftables or CrowdSec.
 > requests. To fix PHP2Shell, update PHP to 8.2.35, 8.3.36, 8.4.27 or 8.5.12 (or install the
 > patched package of your distribution) and restart php-fpm.
 
-Latest update (2026-10-29): new tool fingerprints from honeypot reports, and the signatures are
-part of the code now, so that updates take effect without changes to `config.ini`. Existing
-installations should remove the obsolete options. See the [Changelog](#changelog).
+Latest update (2026-10-31): the boundary is now read the same way as in PHP. Before, some spellings
+of the `Content-Type` header hid all multipart parts from the rules. Also new: more tool
+fingerprints and two new rules. Restart the monitor to apply the update. See the
+[Changelog](#changelog).
+
+## Table of contents
+
+- [Background](#background)
+- [How it works](#how-it-works)
+- [Using the monitor with a WAF](#using-the-monitor-with-a-waf)
+- [Detection rules](#detection-rules)
+- [Output](#output)
+- [Hook](#hook)
+  - [Example: block the IP address with nftables](#example-block-the-ip-address-with-nftables)
+  - [Example: block the IP address with CrowdSec](#example-block-the-ip-address-with-crowdsec)
+- [Installation](#installation)
+  - [1. Daemon](#1-daemon)
+  - [2. nginx](#2-nginx)
+  - [Notes](#notes)
+- [Privacy](#privacy)
+- [Uninstallation](#uninstallation)
+- [References](#references)
+- [Changelog](#changelog)
+- [Credits](#credits)
+- [License](#license)
 
 ## Background
 
@@ -112,7 +134,7 @@ There are two kinds of levels:
   - `php2shell-chain`: the request carries the structure of a complete exploit chain - a trigger
     rule (`upload_progress_field`) together with an injection or preparation rule
     (`serialized_object_in_filename`, `php_code_in_filename`, `session_id_in_body`,
-    `probe_filename`, `suspicious_filename` or `array_spray`), or at least two rules with the
+    `probe_filename`, `suspicious_filename`, `array_spray` or `serialized_int_key_collision`), or at least two rules with the
     rule level `php2shell`. `exploit_tool_user_agent` and `exploit_tool_marker` count as one rule
     here, because several fingerprints in one request usually come from the same tool. This is a
     fully formed exploitation attempt rather than a scan. It does not mean the attempt would have
@@ -136,16 +158,17 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `multipart_header_flood` | php2shell | signal | A multipart part has more than `MAX_PART_HEADERS` (10) header lines or a duplicate header name | CVE-2026-109618: memory amplification closed by the PHP fix |
 | `serialized_object_in_filename` | php2shell | payload, signal | An upload file name or the field name of a file part contains a serialized PHP object or array | Session injection through the upload progress handler, which stores both names |
 | `exploit_tool_user_agent` | php2shell | signal (shared) | The User-Agent matches `TOOL_USER_AGENT_RE` | User-Agent of published exploit tools (for example `php2shell-109618`, `php2shell-verify/1.0`, `B8RAT/1.0`). This is a weak indicator: most tool requests do not send it, and it is easy to change. Boundary markers are more stable. |
-| `exploit_tool_marker` | php2shell | signal (shared) | The body or the Content-Type contains a string from `TOOL_MARKERS` or `extra_tool_markers`, or the Content-Type contains a string from `TOOL_CONTENT_TYPE_MARKERS`. Strings from `OTHER_CONTENT_TYPE_MARKERS` are removed from the Content-Type first. | Fixed strings and multipart boundaries of published exploit tools. `p2shell` matches the boundaries of several tools, including those with `php2shell`. |
+| `exploit_tool_marker` | php2shell | signal (shared) | The body or the Content-Type contains a string from `TOOL_MARKERS` or `extra_tool_markers`, the Content-Type contains a string from `TOOL_CONTENT_TYPE_MARKERS`, or the boundary is exactly a value from `TOOL_EXACT_BOUNDARIES`. Strings from `OTHER_CONTENT_TYPE_MARKERS` are removed from the Content-Type first. | Fixed strings and multipart boundaries of published exploit tools. `p2shell` matches the boundaries of several tools, including those with `php2shell`. |
 | `probe_filename` | php2shell | payload, signal | An upload file name matches `TOOL_FILENAME_RE` | File names of published screening tools for session injection |
 | `empty_boundary_probe` | php2shell | signal | `empty_boundary` together with `large_body` or `deep_nested_field_name` | Memory exhaustion probe of a published screening tool, also with a replaced User-Agent |
+| `serialized_int_key_collision` | php2shell | payload, signal | The body contains the serialized integer keys `i:4294967296;`, `i:8589934592;` and `i:12884901888;`, at most 48 bytes apart | Taken from a published Suricata rule (Corelight), which does not explain the relation to the known exploit chains. Other multiples of 2^32 are not matched. |
 | `empty_field_name` | generic | - | A urlencoded field has no name | Part of CVE-2026-109618, also used by bots |
 | `nul_byte` | generic | - | A urlencoded field name or value, or a multipart part header contains a NUL byte | Part of CVE-2026-109618, also used by vulnerability scanners |
 | `serialized_object_in_field` | generic | - | A urlencoded field value or a multipart field name starts with a serialized PHP object or array | Observed in exploitation attempts, also used by some applications |
 | `deep_nested_field_name` | generic | - | A field name has more than `MAX_FIELD_NESTING` (32) array levels | Observed in requests with up to 200 levels |
 | `session_id_in_body` | generic | payload | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
 | `php_code_in_filename` | generic | payload | An upload file name or the field name of a file part contains `<?` | Session injection, also used in other upload attacks |
-| `suspicious_filename` | generic | payload | An upload file name matches `SUSPICIOUS_FILENAME_RE` | Short file names from exploit chains and probes (`p2s.txt`, `probe.txt`, `a.txt`, `t.txt`, `x.txt`) that regular visitors could also use. Together with `upload_progress_field`, such a probe receives the request level `php2shell-chain`. |
+| `suspicious_filename` | generic | payload | An upload file name matches `SUSPICIOUS_FILENAME_RE` | Short file names from exploit chains and probes (`p2s.txt`, `probe.txt`, `a.txt`, `t.txt`, `x.txt`, `poc.bin`) that regular visitors could also use. Together with `upload_progress_field`, such a probe receives the request level `php2shell-chain`. |
 | `upload_progress_text` | generic | - | The body contains `upload_progress_marker` (any case, plain or URL-encoded), but no multipart field has exactly this name | No effect in PHP. Scans with a wrong spelling, or free text such as a support request about the vulnerability. |
 | `long_filename` | generic | - | An upload file name is longer than `MAX_FILENAME_LENGTH` (1024 bytes) | Session inflation through the upload progress handler |
 | `array_spray` | generic | payload | At least `MAX_SAME_ARRAY_FIELDS` (100) fields have the same array name (for example `t[]`) | Sent by a published exploit tool. The purpose of these fields is unverified. |
@@ -155,6 +178,7 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `multipart_without_boundary` | generic | - | A multipart request has no boundary | Malformed or crafted requests |
 | `empty_boundary` | generic | - | The Content-Type of a multipart request contains `boundary=` with an empty value | Sent by a published screening tool. Browsers and common HTTP libraries never send it. |
 | `repeated_char_boundary` | generic | - | The multipart boundary consists of one character other than `-`, repeated at least eight times | Observed in the confirmed exploit chain. Easy to change. |
+| `malformed_boundary_param` | generic | - | The boundary parameter has characters between `boundary` and `=`, its value starts with whitespace, or an unquoted value is ended by a comma | PHP accepts these spellings. They are not known from attacks, but hide the parts from parsers that read the boundary differently. |
 | `bare_lf_multipart` | generic | - | A multipart delimiter line or header block contains a line break without CR | Sent by a published screening tool. Browsers always send CRLF. |
 | `malformed_content_disposition` | generic | - | A `Content-Disposition` does not start with `form-data`, or a part header has continuation lines | PHP accepts both, browsers send neither. Hides field and file names from simple parsers. |
 | `upload_progress_without_user_agent` | generic | - | `upload_progress_field` matched and the request has no User-Agent, or the User-Agent is the literal string `None` | The confirmed exploit chain and several scanners send no User-Agent. Some Python tools send `None`. |
@@ -185,8 +209,9 @@ to work. Options that were removed are ignored, and a warning is logged at start
 `nginx/php2shell-mirror.conf`. Update the snippet on existing installations.
 
 Multipart bodies are parsed with the variants that PHP accepts: lines may end with CRLF or LF
-only, the boundary may be empty, `name=` and `filename=` are also found directly after the colon
-of `Content-Disposition`, and continuation lines are joined before the search. The handling of an
+only, the boundary may be empty, an unquoted boundary ends at the first `,` or `;`, the `=` does
+not have to follow `boundary` directly, `name=` and `filename=` are also found directly after the
+colon of `Content-Disposition`, and continuation lines are joined before the search. The handling of an
 empty boundary is derived from the behavior of a published screening tool and has not been
 compared with the PHP parser in detail.
 
@@ -525,8 +550,35 @@ longer needed, and check whether the operation complies with your data protectio
 - [Wiz: PHP2Shell exploitation attempts and remediation trends](https://www.wiz.io/blog/php2shell-exploitation-so-far)
 - [CrowdSec: virtual patching for PHP2Shell](https://www.crowdsec.net/blog/php2shell-virtual-patching)
 - [CrowdSec documentation: virtual patching and CRS](https://docs.crowdsec.net/docs/v1.6/appsec/vpatch_and_crs)
+- [Arctic Wolf: PHP2Shell](https://arcticwolf.com/resources/blog/php2shell-critical-php-vulnerabilities-enable-unauthenticated-remote-code-execution/)
+- [corelight/php2shell-detect: Suricata rules](https://github.com/corelight/php2shell-detect)
+- [php-src: multipart parser (`main/rfc1867.c`)](https://github.com/php/php-src/blob/PHP-8.5/main/rfc1867.c)
 
 ## Changelog
+
+### 2026-10-31
+
+Upgrade notes:
+
+- Restart the monitor. `config.ini` and the nginx snippet are unchanged.
+
+Fixed:
+
+- The boundary is read the same way as in PHP. Before, the monitor did not find the parts of a
+  request with `boundary=abc,def` or `boundary =abc`, so that multipart rules such as
+  `upload_progress_field` did not match. A request with an unterminated quoted boundary is now
+  reported as `multipart_without_boundary`, because PHP rejects it.
+
+New:
+
+- Rule `malformed_boundary_param` (generic).
+- Rule `serialized_int_key_collision` (php2shell).
+- Tool markers `P2SFNAME`, `P2SVALUE`, `P2SOP-`, `NUCLEIve97RH0fzh`, `RCE_noyzzg0YVLBU`,
+  `PHP2SHELL_CONFIRMED` and `php2shell-scan inert canary`.
+- Tool boundaries `VERIFY` and `--VERIFY`, compared with the complete boundary.
+- `suspicious_filename` also matches `poc.bin`.
+- `test_requests.py` sends an additional request with a comma after the boundary.
+- README: table of contents.
 
 ### 2026-10-29 (second update)
 

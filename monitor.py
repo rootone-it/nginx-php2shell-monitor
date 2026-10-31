@@ -106,9 +106,10 @@ def event_dict(req, findings, capture_name, repeat):
 # screening tool.
 MULTIPART_NAME_RE = re.compile(rb'[;:]\s*name=(?:"([^"]*)"|([^;\s]*))', re.IGNORECASE)
 MULTIPART_FILENAME_RE = re.compile(rb'[;:]\s*filename=(?:"([^"]*)"|([^;\r\n]*))', re.IGNORECASE)
-# The boundary may be empty ("boundary="). Browsers never send that, but a
-# published screening tool does. PHP then uses "--" as delimiter line.
-BOUNDARY_RE = re.compile(r'boundary=(?:"([^"]*)"|([^;\s]*))', re.IGNORECASE)
+# Boundary parameters that PHP accepts (see multipart_boundary), but browsers
+# and common HTTP libraries do not send: characters between "boundary" and "=",
+# a value starting with whitespace, or an unquoted value ended by a comma.
+MALFORMED_BOUNDARY_RE = re.compile(r'boundary(?:[^=]+=|=\s|=[^";,]*,)', re.IGNORECASE)
 # Line break within a multipart header block that is not preceded by CR.
 BARE_LF_RE = re.compile(rb'(?<!\r)\n')
 # Folded header line (continuation line starting with a space or a tab).
@@ -121,6 +122,12 @@ SERIALIZED_RE = re.compile(rb'(?:\||^)[OCa]:\d+:')
 # e.g. O:8:"stdClass" or a:2:{. Stricter than SERIALIZED_RE, because field
 # values contain more free text than file names.
 SERIALIZED_VALUE_RE = re.compile(rb'(?:^|\|)(?:[OC]:\d+:"|a:\d+:\{)')
+
+# Three serialized integer keys that are multiples of 2^32, at most 48 bytes
+# apart (Corelight Suricata rule sid 3000653). The rule does not explain the
+# relation to the known exploit chains.
+SERIALIZED_INT_KEYS_RE = re.compile(
+    rb'i:4294967296;.{0,48}i:8589934592;.{0,48}i:12884901888;', re.DOTALL)
 
 # Thresholds derived from the published exploits. Regular forms stay far below
 # them, so they do not depend on the monitored site and are not configurable.
@@ -155,9 +162,15 @@ TOOL_USER_AGENT_RE = re.compile(r'php2shell|^B8RAT/', re.IGNORECASE)
 SCANNER_USER_AGENT_RE = re.compile(r'Company-PHP-Audit|trap-test-rev|php-cve-version-check', re.IGNORECASE)
 
 # Fixed strings of exploit tools, searched in the body and the Content-Type
-# (case-insensitive). p2s-rider: upload progress probes (Defused).
+# (case-insensitive). p2s-rider: upload progress probes (Defused). P2SFNAME to
+# "php2shell-scan inert canary": strings that tools use to match responses to
+# their requests (Arctic Wolf). Words like "php2shell" alone are only searched
+# in the Content-Type (see TOOL_CONTENT_TYPE_MARKERS); these full strings are
+# specific enough for the body.
 TOOL_MARKERS = ("JACKALPOC", "B7kQpoc", "p2s-rider", "neosc4n", "neo_obj_inject", "sf618_",
-                "xqsuvwz3n97wu8j3emz1axuo5y")
+                "xqsuvwz3n97wu8j3emz1axuo5y", "P2SFNAME", "P2SVALUE", "P2SOP-",
+                "NUCLEIve97RH0fzh", "RCE_noyzzg0YVLBU", "PHP2SHELL_CONFIRMED",
+                "php2shell-scan inert canary")
 
 # Multipart boundaries of exploit tools, only searched in the Content-Type
 # (case-insensitive). Words like "php2shell" can also appear in regular form
@@ -166,6 +179,12 @@ TOOL_MARKERS = ("JACKALPOC", "B7kQpoc", "p2s-rider", "neosc4n", "neo_obj_inject"
 # "----php2shell<hex>" (F5). CHKBND: manual check script (OffSeq).
 TOOL_CONTENT_TYPE_MARKERS = ("p2sBoundary", "p2shell", "p2s9rdme2st6guc9g0rafic", "SCANBOUND", "WRITEBOUND",
                              "NeoMM2026", "BNDRY12345", "BGCTXBOUNDARY", "CHKBND")
+
+# Multipart boundaries of exploit tools that are too short or too common for a
+# search in the Content-Type. They are compared with the complete boundary.
+# VERIFY: operator with active code execution (Zscaler). The source does not
+# clearly show whether "--VERIFY" is the boundary or the delimiter line.
+TOOL_EXACT_BOUNDARIES = (b"VERIFY", b"--VERIFY")
 
 # Boundaries of other campaigns with a similar request shape, only searched in
 # the Content-Type. They are logged with the rule level generic to separate
@@ -179,10 +198,11 @@ OTHER_CONTENT_TYPE_MARKERS = ("wp2shell", "php2shell-golang")
 # the session. Rule level php2shell.
 TOOL_FILENAME_RE = re.compile(rb'^MARKER_[0-9a-f]{8}|^___PHP2SHELL_PROBE_[0-9a-f]{8}___$', re.IGNORECASE)
 
-# Short upload file names of exploit chains and probes (F5, OffSeq) that regular
-# visitors could use as well. Rule level generic, but they count as payload for
-# the request level php2shell-chain together with the upload progress field.
-SUSPICIOUS_FILENAME_RE = re.compile(rb'^(p2s|probe|[atx])\.txt$', re.IGNORECASE)
+# Short upload file names of exploit chains and probes (F5, OffSeq, Zscaler) that
+# regular visitors could use as well. Rule level generic, but they count as
+# payload for the request level php2shell-chain together with the upload
+# progress field.
+SUSPICIOUS_FILENAME_RE = re.compile(rb'^(?:(?:p2s|probe|[atx])\.txt|poc\.bin)$', re.IGNORECASE)
 
 # Rules with the rule level "php2shell" (specific to PHP2Shell). All other
 # rules have the rule level "generic". A request receives the request level
@@ -197,6 +217,7 @@ PHP2SHELL_RULES = (
     "exploit_tool_marker",
     "probe_filename",
     "empty_boundary_probe",
+    "serialized_int_key_collision",
 )
 
 # All other rules. Together with PHP2SHELL_RULES, these are the names allowed
@@ -218,6 +239,7 @@ GENERIC_RULES = (
     "multipart_without_boundary",
     "empty_boundary",
     "repeated_char_boundary",
+    "malformed_boundary_param",
     "bare_lf_multipart",
     "malformed_content_disposition",
     "upload_progress_without_user_agent",
@@ -241,6 +263,7 @@ PHP2SHELL_PAYLOAD_RULES = (
     "probe_filename",
     "suspicious_filename",
     "array_spray",
+    "serialized_int_key_collision",
 )
 
 # Fingerprints of exploit tools. Several of them in one request usually come
@@ -292,11 +315,39 @@ def parse_urlencoded(body):
 
 
 def multipart_boundary(content_type):
-    """Returns the boundary as bytes (possibly empty), or None if it is missing."""
-    match = BOUNDARY_RE.search(content_type)
-    if not match:
+    """
+    Returns the boundary as bytes, or None if PHP would not find one. Follows
+    the steps of PHP (main/rfc1867.c), because a different result hides all
+    parts from the rules:
+
+    - The word "boundary" is searched case-sensitively first, then in any case.
+    - The value starts after the next "=", which does not have to follow the
+      word directly.
+    - A quoted value ends at the closing quote. Without one, PHP rejects the
+      request.
+    - An unquoted value ends at the first "," or ";". Whitespace is part of it.
+
+    The boundary may be empty ("boundary="). Browsers never send that, but a
+    published screening tool does. PHP then uses "--" as delimiter line.
+    """
+    start = content_type.find("boundary")
+    if start < 0:
+        start = content_type.lower().find("boundary")
+    if start < 0:
         return None
-    return (match.group(1) if match.group(1) is not None else match.group(2)).encode("latin-1")
+    equals = content_type.find("=", start)
+    if equals < 0:
+        return None
+    value = content_type[equals + 1:]
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        if end < 0:
+            return None
+        return value[1:end].encode("latin-1")
+    end = re.search(r'[,;]', value)
+    if end:
+        value = value[:end.start()]
+    return value.encode("latin-1")
 
 
 def parse_multipart(body, boundary):
@@ -423,6 +474,10 @@ def analyze(req, rules):
         findings.append({"rule": "chunked_multipart",
                          "detail": "multipart/form-data with Transfer-Encoding: %s" % req["transfer_encoding"]})
 
+    if SERIALIZED_INT_KEYS_RE.search(body):
+        findings.append({"rule": "serialized_int_key_collision",
+                         "detail": "three serialized integer keys, multiples of 2^32"})
+
     names = []
     if content_type.startswith("application/x-www-form-urlencoded"):
         fields = parse_urlencoded(body)
@@ -458,6 +513,12 @@ def analyze(req, rules):
             # or hexadecimal boundaries.
             elif len(boundary) >= 8 and len(set(boundary)) == 1 and boundary[:1] != b"-":
                 findings.append({"rule": "repeated_char_boundary",
+                                 "detail": "boundary '%s'" % short(boundary)})
+            if MALFORMED_BOUNDARY_RE.search(req["content_type"]):
+                findings.append({"rule": "malformed_boundary_param",
+                                 "detail": "Content-Type '%s'" % req["content_type"][:100]})
+            if boundary in TOOL_EXACT_BOUNDARIES:
+                findings.append({"rule": "exploit_tool_marker",
                                  "detail": "boundary '%s'" % short(boundary)})
             parts = parse_multipart(body, boundary)
         names = [p["name"] for p in parts]
