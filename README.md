@@ -167,6 +167,7 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `serialized_object_in_field` | generic | - | A urlencoded field value or a multipart field name starts with a serialized PHP object or array | Observed in exploitation attempts, also used by some applications |
 | `deep_nested_field_name` | generic | - | A field name has more than `MAX_FIELD_NESTING` (32) array levels | Observed in requests with up to 200 levels |
 | `session_id_in_body` | generic | payload | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
+| `oversized_session_cookie` | generic | - | The value of the cookie named `session_name` is longer than `MAX_SESSION_COOKIE_LENGTH` (256 bytes) | Listed as a request feature by one vendor (Harness), without a threshold and without a relation to a specific exploit chain. 256 is the upper limit of `session.sid_length`. Applications with longer custom session IDs can match. |
 | `php_code_in_filename` | generic | payload | An upload file name or the field name of a file part contains `<?` | Session injection, also used in other upload attacks |
 | `suspicious_filename` | generic | payload | An upload file name matches `SUSPICIOUS_FILENAME_RE` | Short file names from exploit chains and probes (`p2s.txt`, `probe.txt`, `a.txt`, `t.txt`, `x.txt`, `poc.bin`) that regular visitors could also use. Together with `upload_progress_field`, such a probe receives the request level `php2shell-chain`. |
 | `upload_progress_text` | generic | - | The body contains `upload_progress_marker` (any case, plain or URL-encoded), but no multipart field has exactly this name | No effect in PHP. Scans with a wrong spelling, or free text such as a support request about the vulnerability. |
@@ -220,8 +221,8 @@ compared with the PHP parser in detail.
 application sets at run time (for example with `session_name()`) is not set yet when PHP parses
 the request body.
 
-`react2shell_lookalike` uses the original request headers, which nginx passes to the mirror
-location by default.
+`react2shell_lookalike` and `oversized_session_cookie` use the original request headers, which
+nginx passes to the mirror location by default.
 
 `max_body_bytes` in the `[server]` section must be at least as large as `client_max_body_size` of
 the monitored sites. Otherwise, content after this limit is not inspected.
@@ -553,8 +554,22 @@ longer needed, and check whether the operation complies with your data protectio
 - [Arctic Wolf: PHP2Shell](https://arcticwolf.com/resources/blog/php2shell-critical-php-vulnerabilities-enable-unauthenticated-remote-code-execution/)
 - [corelight/php2shell-detect: Suricata rules](https://github.com/corelight/php2shell-detect)
 - [php-src: multipart parser (`main/rfc1867.c`)](https://github.com/php/php-src/blob/PHP-8.5/main/rfc1867.c)
+- [Harness: PHP2Shell](https://www.harness.io/blog/php2shell-the-flaw-hiding-all-across-the-web)
+- [Hunt.io: PHP2Shell honeypot shells](https://hunt.io/blog/php2shell-honeypot-shells-root-palo-alto-firewalls)
 
 ## Changelog
+
+### 2026-11-02
+
+Upgrade notes:
+
+- Restart the monitor. `config.ini` and the nginx snippet are unchanged.
+
+New:
+
+- Rule `oversized_session_cookie` (generic).
+- Tool markers `__PHP2SHELL_PROBE` and `attacksessionid0001`. `TOOL_MARKERS` does not search the
+  `Cookie` header, so `attacksessionid0001` only matches in the body or the Content-Type.
 
 ### 2026-10-31
 

@@ -146,6 +146,10 @@ MAX_SAME_ARRAY_FIELDS = 100
 # Array levels in a field name, e.g. a[b][c] has two. Observed in requests with
 # up to 200 levels (PHP default for max_input_nesting_level: 64).
 MAX_FIELD_NESTING = 32
+# Length of the session cookie value in bytes. Harness lists oversized session
+# cookies as a request feature, but names no value. 256 is the upper limit of
+# the PHP setting session.sid_length.
+MAX_SESSION_COOKIE_LENGTH = 256
 
 # Fingerprints of published exploit and screening tools. They are part of the
 # rules and are updated with new releases. Additional markers can be added with
@@ -164,13 +168,15 @@ SCANNER_USER_AGENT_RE = re.compile(r'Company-PHP-Audit|trap-test-rev|php-cve-ver
 # Fixed strings of exploit tools, searched in the body and the Content-Type
 # (case-insensitive). p2s-rider: upload progress probes (Defused). P2SFNAME to
 # "php2shell-scan inert canary": strings that tools use to match responses to
-# their requests (Arctic Wolf). Words like "php2shell" alone are only searched
-# in the Content-Type (see TOOL_CONTENT_TYPE_MARKERS); these full strings are
-# specific enough for the body.
+# their requests (Arctic Wolf). __PHP2SHELL_PROBE, attacksessionid0001: kit
+# markers that Hunt.io recommends searching for on the host, not in requests.
+# Words like "php2shell" alone are only searched in the Content-Type (see
+# TOOL_CONTENT_TYPE_MARKERS); these full strings are specific enough for the
+# body.
 TOOL_MARKERS = ("JACKALPOC", "B7kQpoc", "p2s-rider", "neosc4n", "neo_obj_inject", "sf618_",
                 "xqsuvwz3n97wu8j3emz1axuo5y", "P2SFNAME", "P2SVALUE", "P2SOP-",
                 "NUCLEIve97RH0fzh", "RCE_noyzzg0YVLBU", "PHP2SHELL_CONFIRMED",
-                "php2shell-scan inert canary")
+                "php2shell-scan inert canary", "__PHP2SHELL_PROBE", "attacksessionid0001")
 
 # Multipart boundaries of exploit tools, only searched in the Content-Type
 # (case-insensitive). Words like "php2shell" can also appear in regular form
@@ -228,6 +234,7 @@ GENERIC_RULES = (
     "serialized_object_in_field",
     "deep_nested_field_name",
     "session_id_in_body",
+    "oversized_session_cookie",
     "php_code_in_filename",
     "suspicious_filename",
     "upload_progress_text",
@@ -466,6 +473,19 @@ def analyze(req, rules):
     if any(key.lower() == "next-action" for key, _ in req["headers"]):
         findings.append({"rule": "react2shell_lookalike",
                          "detail": "Next-Action header present"})
+
+    # Oversized session cookie (Harness). The relation to a specific exploit
+    # chain is not documented, therefore generic. PHP compares the cookie name
+    # case-sensitively.
+    for key, value in req["headers"]:
+        if key.lower() != "cookie":
+            continue
+        for cookie in value.split(";"):
+            cookie_name, _, cookie_value = cookie.partition("=")
+            if cookie_name.strip() == rules["session_name"] and len(cookie_value.strip()) > MAX_SESSION_COOKIE_LENGTH:
+                findings.append({"rule": "oversized_session_cookie",
+                                 "detail": "cookie '%s' has %d bytes" % (
+                                     rules["session_name"], len(cookie_value.strip()))})
 
     # Chunked request body: removes the Content-Length that PHP checks against
     # post_max_size. nginx passes the original Transfer-Encoding in a separate
