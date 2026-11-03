@@ -165,6 +165,7 @@ rules, receives this level. The two rules marked *signal (shared)* count as one 
 | `empty_field_name` | generic | - | A urlencoded field has no name | Part of CVE-2026-109618, also used by bots |
 | `nul_byte` | generic | - | A urlencoded field name or value, or a multipart part header contains a NUL byte | Part of CVE-2026-109618, also used by vulnerability scanners |
 | `serialized_object_in_field` | generic | - | A urlencoded field value or a multipart field name starts with a serialized PHP object or array | Observed in exploitation attempts, also used by some applications |
+| `serialized_scalar_in_filename` | generic | - | An upload file name or the field name of a file part contains `\|` followed by a serialized scalar value (string, integer, double, boolean, null, reference or enum), see `SERIALIZED_SCALAR_RE` | Taken from a published Splunk rule, which also matches these values without `\|`. The `\|` is the separator of the PHP session format. No attacks with these values have been reported. |
 | `deep_nested_field_name` | generic | - | A field name has more than `MAX_FIELD_NESTING` (32) array levels | Observed in requests with up to 200 levels |
 | `session_id_in_body` | generic | payload | A multipart field is named exactly like the session cookie (`session_name`) | Session fixation used in published attack chains. PHP takes the session ID from this field if the request has no session cookie. |
 | `oversized_session_cookie` | generic | - | The value of the cookie named `session_name` is longer than `MAX_SESSION_COOKIE_LENGTH` (256 bytes) | Listed as a request feature by one vendor (Harness), without a threshold and without a relation to a specific exploit chain. 256 is the upper limit of `session.sid_length`. Applications with longer custom session IDs can match. |
@@ -556,8 +557,19 @@ longer needed, and check whether the operation complies with your data protectio
 - [php-src: multipart parser (`main/rfc1867.c`)](https://github.com/php/php-src/blob/PHP-8.5/main/rfc1867.c)
 - [Harness: PHP2Shell](https://www.harness.io/blog/php2shell-the-flaw-hiding-all-across-the-web)
 - [Hunt.io: PHP2Shell honeypot shells](https://hunt.io/blog/php2shell-honeypot-shells-root-palo-alto-firewalls)
+- [Splunk: Serialized PHP Token in Upload Filename - Suricata](https://github.com/splunk/security_content/blob/develop/detections/web/serialized_php_token_in_upload_filename___suricata.yml)
 
 ## Changelog
+
+### 2026-11-03
+
+Upgrade notes:
+
+- Restart the monitor. `config.ini` and the nginx snippet are unchanged.
+
+New:
+
+- Rule `serialized_scalar_in_filename` (generic).
 
 ### 2026-11-02
 

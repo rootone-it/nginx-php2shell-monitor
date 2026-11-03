@@ -118,6 +118,14 @@ FOLDED_HEADER_RE = re.compile(rb'\r?\n[ \t]+')
 # Serialized PHP object or array as used in session injection, e.g. |O:8:"stdClass"
 SERIALIZED_RE = re.compile(rb'(?:\||^)[OCa]:\d+:')
 
+# Serialized scalar value after "|", the separator of the PHP session format:
+# string, integer, double, boolean, null, reference or enum, e.g. |s:4:" or |b:1;
+# Derived from the Splunk rule "Serialized PHP Token in Upload Filename -
+# Suricata", which also matches these tokens without "|". The "|" is required
+# here, because short tokens such as "N;" or "s:1:" also occur in regular file
+# names. No attacks with these tokens have been reported.
+SERIALIZED_SCALAR_RE = re.compile(rb'\|(?:s:\d+:"|i:-?\d+;|d:[-+0-9.eEINFA]+;|b:[01];|N;|[rR]:\d+;|E:\d+:")')
+
 # Serialized PHP object or array at the start of a field value or after "|",
 # e.g. O:8:"stdClass" or a:2:{. Stricter than SERIALIZED_RE, because field
 # values contain more free text than file names.
@@ -232,6 +240,7 @@ GENERIC_RULES = (
     "empty_field_name",
     "nul_byte",
     "serialized_object_in_field",
+    "serialized_scalar_in_filename",
     "deep_nested_field_name",
     "session_id_in_body",
     "oversized_session_cookie",
@@ -610,6 +619,9 @@ def analyze(req, rules):
                 for label, value in (("filename", filename), ("field name of file part", p["name"])):
                     if SERIALIZED_RE.search(value):
                         findings.append({"rule": "serialized_object_in_filename",
+                                         "detail": "%s '%s'" % (label, short(value))})
+                    if SERIALIZED_SCALAR_RE.search(value):
+                        findings.append({"rule": "serialized_scalar_in_filename",
                                          "detail": "%s '%s'" % (label, short(value))})
                     if b"<?" in value:
                         findings.append({"rule": "php_code_in_filename",
